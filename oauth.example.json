@@ -1,0 +1,10 @@
+{
+  "access_token": "sk-ant-oat01-your-access-token",
+  "disabled": false,
+  "email": "your-email@example.com",
+  "expired": "2026-01-01T00:00:00Z",
+  "id_token": "",
+  "last_refresh": "2026-01-01T00:00:00Z",
+  "refresh_token": "sk-ant-ort01-your-refresh-token",
+  "type": "claude"
+}

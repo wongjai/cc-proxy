@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+oauth.json
+.cc_proxy_ids.json
+logs/

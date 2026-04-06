@@ -1,0 +1,12 @@
+{
+  "listen_host": "0.0.0.0",
+  "listen_port": 18081,
+  "api_keys": {
+    "my-app": "ccp-your-api-key-here"
+  },
+  "oauth_file": "oauth.json",
+  "telegram_bot_token": "",
+  "telegram_admin_ids": [],
+  "db_path": "cc-proxy.db",
+  "log_dir": "logs"
+}

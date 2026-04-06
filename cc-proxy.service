@@ -1,0 +1,14 @@
+[Unit]
+Description=CC Proxy - Claude Code API Proxy
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/cc-proxy
+ExecStart=/opt/cc-proxy/venv/bin/python3 -u /opt/cc-proxy/server.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
