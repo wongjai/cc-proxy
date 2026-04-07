@@ -190,6 +190,88 @@ def _refresh_token(oauth_data):
         return oauth_data["access_token"]
 
 
+async def _proactive_token_refresh():
+    """主动检查 token 是否即将过期（< 10 分钟），提前刷新并通知 TG。
+    刷新最多重试 3 次，用量获取最多重试 2 次。"""
+    try:
+        oauth_data = _load_oauth_sync()
+    except Exception as e:
+        print(f"[OAuth] Proactive: load oauth failed: {e}")
+        return
+
+    expired_str = oauth_data.get("expired", "")
+    if not expired_str:
+        return
+
+    try:
+        expired_dt = datetime.fromisoformat(expired_str.replace("Z", "+00:00"))
+        remaining = (expired_dt - datetime.now(timezone.utc)).total_seconds()
+    except Exception:
+        remaining = -1  # 解析失败视为已过期，直接刷
+
+    if remaining >= 600:
+        return  # 还有 10 分钟以上，不动
+
+    print(f"[OAuth] Proactive: {remaining:.0f}s remaining, refreshing...")
+
+    # 刷新 token，最多重试 3 次
+    access_token = None
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            access_token = await asyncio.to_thread(_refresh_token, oauth_data)
+            print(f"[OAuth] Proactive: refresh OK (attempt {attempt})")
+            break
+        except Exception as e:
+            last_err = e
+            print(f"[OAuth] Proactive: refresh attempt {attempt} failed: {e}")
+            if attempt < 3:
+                await asyncio.sleep(10 * attempt)  # 10s, 20s
+
+    if access_token is None:
+        msg = f"⚠️ OAuth 主动刷新失败（已重试 3 次）\n错误: {last_err}"
+        print(f"[OAuth] Proactive: all retries failed")
+        tgbot.notify_admins(msg)
+        return
+
+    # 重新读取刷新后的 oauth（_refresh_token 已写入文件）
+    try:
+        oauth_data = _load_oauth_sync()
+        new_expired = oauth_data.get("expired", "?")
+    except Exception:
+        new_expired = "?"
+
+    # 获取用量，最多重试 2 次
+    usage_text = ""
+    for attempt in range(1, 3):
+        try:
+            usage_data = await asyncio.to_thread(tgbot._fetch_oauth_usage, access_token)
+            usage_text = tgbot._format_usage(usage_data)
+            break
+        except Exception as e:
+            print(f"[OAuth] Proactive: usage fetch attempt {attempt} failed: {e}")
+            if attempt < 2:
+                await asyncio.sleep(5)
+            else:
+                usage_text = f"⚠️ 用量获取失败: {e}"
+
+    # 北京时间格式化
+    def _to_bjt(s):
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            bjt = dt.astimezone(timezone(timedelta(hours=8)))
+            return bjt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return s
+
+    msg = (
+        f"✅ OAuth Token 已主动刷新\n"
+        f"新过期时间: <code>{_to_bjt(new_expired)}</code>\n\n"
+        f"<b>📊 当前用量</b>\n{usage_text}"
+    )
+    tgbot.notify_admins(msg)
+
+
 async def get_access_token():
     async with _oauth_lock:
         oauth_data = _load_oauth_sync()
@@ -508,12 +590,24 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 print(f"[DB] WAL checkpoint failed: {e}")
 
+    # 主动 OAuth token 刷新循环（剩余 < 10 分钟时刷新）
+    async def oauth_proactive_refresh_loop():
+        await asyncio.sleep(30)  # 启动后等 30s 再开始
+        while True:
+            try:
+                await _proactive_token_refresh()
+            except Exception as e:
+                print(f"[OAuth] Proactive refresh loop error: {e}")
+            await asyncio.sleep(60)
+
     _wal_task = asyncio.create_task(wal_checkpoint_loop())
+    _refresh_task = asyncio.create_task(oauth_proactive_refresh_loop())
 
     yield
 
     # 关闭
     _wal_task.cancel()
+    _refresh_task.cancel()
     await _http_client.aclose()
 
 
