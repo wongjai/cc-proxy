@@ -117,7 +117,7 @@ def _refresh_token(oauth_data):
             "grant_type": "refresh_token",
             "refresh_token": oauth_data["refresh_token"],
             "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-            "scope": "user:inference user:profile",
+            "scope": "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
         },
         headers={"Content-Type": "application/json"},
         timeout=30,
@@ -316,6 +316,7 @@ def transform_request(body):
 
     if supports_adaptive or supports_thinking:
         payload["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}
+    if supports_adaptive:
         payload["output_config"] = {"effort": "high"}
 
     return payload
