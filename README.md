@@ -5,7 +5,8 @@ Claude Code 伪装反向代理。接收标准 Anthropic `/v1/messages` 请求，
 ## 特性
 
 - **Claude Code 指纹注入** — 自动伪装为 Claude CLI 客户端（版本号、User-Agent、Beta Features、CCH 签名、Fingerprint）
-- **OAuth Token 管理** — 使用 Anthropic OAuth 认证，Token 过期前自动刷新
+- **OAuth 登录** — 通过 Telegram Bot 一键 OAuth 登录 Anthropic 账号，自动获取 Token，无需手动填写
+- **OAuth Token 管理** — Token 过期前自动刷新，也可通过 Bot 手动刷新或重新登录
 - **多 API Key** — 支持多个自定义 API Key，通过 `Authorization: Bearer <key>` 或 `x-api-key` 鉴权
 - **智能 Thinking** — 根据模型自动选择 thinking 模式：Opus 用 adaptive，Sonnet 用 enabled（budget 10K），Haiku 不启用
 - **缓存断点** — 自动在最后两条用户消息上注入 `cache_control`，最大化 Prompt Caching 命中率
@@ -66,7 +67,11 @@ pip install requests xxhash
 
 #### oauth.json
 
-从 Claude 平台获取 OAuth Token，格式如下：
+**推荐方式**：通过 Telegram Bot 的「🔑 登录获取 Token」功能自动完成 OAuth 登录，无需手动填写此文件。
+
+Bot 会引导你在浏览器中登录 Anthropic 账号，登录后将页面上显示的 authorization code 回复给 Bot，即可自动获取并保存 Token。
+
+如需手动配置，格式如下：
 
 ```json
 {
@@ -141,14 +146,19 @@ curl -X POST http://your-server:18081/v1/messages \
 
 ### Telegram Bot
 
-启用 Bot 后，发送 `/start` 或 `/menu` 打开管理面板：
+启用 Bot 后，发送 `/start` 查看使用引导，发送 `/menu` 打开管理面板：
 
 | 功能 | 说明 |
 |------|------|
+| 🔐 管理 OAuth | OAuth 登录、查看/设置/刷新 Token |
 | 🔑 管理 API Key | 添加/删除 API Key |
-| 🔐 管理 OAuth | 查看/设置/刷新 OAuth Token |
 | 📊 统计汇总 | 按时间范围查看请求统计、Token 用量、错误详情 |
 | 📋 最近日志 | 查看最近 20 条调用日志及耗时 |
+
+**快速开始：**
+1. `/start` → 点击「🔐 管理 OAuth」→「🔑 登录获取 Token」→ 浏览器登录 → 复制 code 回复 Bot
+2. 点击「🔑 管理 API Key」→「➕ 添加」→ 创建 API Key
+3. 使用该 Key 通过代理调用 API
 
 快捷命令：`/keys`、`/oauth`、`/stats`、`/logs`
 
@@ -211,14 +221,14 @@ cc-proxy/
 ├── tgbot.py            # Telegram Bot 管理面板
 ├── db.py               # SQLite 日志模块
 ├── config.json         # 配置文件
-├── oauth.json          # OAuth Token（需自行填写）
+├── oauth.json          # OAuth Token（通过 Bot 登录自动生成，或手动填写）
 ├── cc-proxy.service    # systemd 服务文件
 └── cc-proxy.db         # SQLite 数据库（运行后自动创建）
 ```
 
 ## 注意事项
 
-- OAuth Token 需要从 Claude 平台获取，首次需手动填写 `oauth.json`
+- OAuth Token 推荐通过 TG Bot 的登录功能自动获取，也可手动填写 `oauth.json`
 - `api_keys` 为空时所有请求都会被拒绝，至少需要添加一个
 - 数据库文件 `cc-proxy.db` 运行后自动创建，使用 WAL 模式
 - `telegram_admin_ids` 为空数组时任何人都可以使用 Bot，生产环境建议填写管理员 ID
