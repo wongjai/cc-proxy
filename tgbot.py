@@ -22,9 +22,10 @@ import db
 
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
-OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+OAUTH_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
 OAUTH_MANUAL_REDIRECT = "https://platform.claude.com/oauth/code/callback"
 OAUTH_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 
 _bot_token = None
@@ -221,7 +222,23 @@ def _handle_oauth_menu(chat_id, msg_id, cb_id):
         oauth = _load_oauth()
         email = oauth.get("email", "?")
         expired = _utc_to_bjt(oauth.get("expired", ""))
-        text = f"<b>OAuth 管理</b>\nEmail: <code>{email}</code>\n过期: <code>{expired}</code>"
+
+        # 获取使用量（token 过期会自动刷新）
+        usage_text = ""
+        try:
+            from server import get_access_token_sync
+            access_token = get_access_token_sync()
+            usage_data = _fetch_oauth_usage(access_token)
+            usage_text = _format_usage(usage_data)
+        except Exception as e:
+            usage_text = f"⚠️ 获取使用量失败: {e}"
+
+        text = (
+            f"<b>OAuth 管理</b>\n"
+            f"Email: <code>{email}</code>\n"
+            f"过期: <code>{expired}</code>\n\n"
+            f"<b>📊 使用量</b>\n{usage_text}"
+        )
     except Exception:
         text = "<b>OAuth 管理</b>\n⚠️ 未配置 OAuth"
     _edit(chat_id, msg_id, text, _inline_kb([
@@ -287,6 +304,76 @@ def _fetch_oauth_profile(access_token):
     })
     with urlopen(req, timeout=15) as resp:
         return json.loads(resp.read())
+
+
+def _fetch_oauth_usage(access_token):
+    """获取 OAuth 账户使用量"""
+    req = Request(OAUTH_USAGE_URL, headers={
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": _OAUTH_UA,
+    })
+    with urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+def _format_usage(usage_data):
+    """格式化使用量信息为可读文本"""
+    if not usage_data:
+        return "❓ 无法获取使用量"
+
+    lines = []
+
+    # 5-hour window
+    fh = usage_data.get("five_hour")
+    if fh and fh.get("utilization") is not None:
+        util = fh["utilization"]
+        reset = fh.get("resets_at")
+        line = f"⏱ 5h: {util:.0f}%"
+        if reset:
+            line += f" (重置: {_utc_to_bjt(reset)})"
+        lines.append(line)
+
+    # 7-day window
+    sd = usage_data.get("seven_day")
+    if sd and sd.get("utilization") is not None:
+        util = sd["utilization"]
+        reset = sd.get("resets_at")
+        line = f"📅 7d: {util:.0f}%"
+        if reset:
+            line += f" (重置: {_utc_to_bjt(reset)})"
+        lines.append(line)
+
+    # 7-day sonnet
+    sds = usage_data.get("seven_day_sonnet")
+    if sds and sds.get("utilization") is not None:
+        util = sds["utilization"]
+        reset = sds.get("resets_at")
+        line = f"🤖 Sonnet 7d: {util:.0f}%"
+        if reset:
+            line += f" (重置: {_utc_to_bjt(reset)})"
+        lines.append(line)
+
+    # 7-day opus
+    sdo = usage_data.get("seven_day_opus")
+    if sdo and sdo.get("utilization") is not None:
+        util = sdo["utilization"]
+        reset = sdo.get("resets_at")
+        line = f"🧠 Opus 7d: {util:.0f}%"
+        if reset:
+            line += f" (重置: {_utc_to_bjt(reset)})"
+        lines.append(line)
+
+    # Extra usage credits
+    extra = usage_data.get("extra_usage")
+    if extra and extra.get("is_enabled"):
+        used = extra.get("used_credits", 0)
+        limit = extra.get("monthly_limit", 0)
+        util = extra.get("utilization", 0)
+        line = f"💰 额外额度: ${used:.2f} / ${limit:.2f} ({util:.1f}%)"
+        lines.append(line)
+
+    return "\n".join(lines) if lines else "✅ 无使用量数据"
 
 
 def _handle_oa_login(chat_id, msg_id, cb_id):

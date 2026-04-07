@@ -167,12 +167,11 @@ def _refresh_token(oauth_data):
     with _sync_token_lock:
         print("[OAuth] Refreshing token...")
         resp = httpx.post(
-            "https://platform.claude.com/v1/oauth/token",
+            "https://api.anthropic.com/v1/oauth/token",
             json={
                 "grant_type": "refresh_token",
                 "refresh_token": oauth_data["refresh_token"],
                 "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-                "scope": "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
             },
             headers={"Content-Type": "application/json", "User-Agent": CLI_USER_AGENT},
             timeout=30,
