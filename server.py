@@ -1,32 +1,51 @@
 """
-CC Proxy v2.0 — Claude Code 模拟中转服务
-接收 /v1/messages 请求，注入 Claude Code 参数后转发至 Anthropic API。
-支持多 API Key、SQLite 日志、Telegram Bot 管理。
+CC Proxy v3.0 — Claude Code 模拟中转服务
+基于 FastAPI + uvicorn + httpx，异步并发，连接池复用。
 """
 
 import json
 import hashlib
+import hmac
 import uuid
 import os
 import time
+import asyncio
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
+from contextlib import asynccontextmanager
 
-import requests
+import httpx
 import xxhash
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 import db
 import tgbot
 
-# ─── 配置加载 ───
+# ─── 配置加载（带缓存）───
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+
+_config_cache = None
+_config_mtime = 0
+_config_lock = threading.Lock()
 
 
 def load_config():
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+    global _config_cache, _config_mtime
+    with _config_lock:
+        try:
+            mt = os.path.getmtime(CONFIG_PATH)
+        except OSError:
+            mt = 0
+        if _config_cache is None or mt != _config_mtime:
+            with open(CONFIG_PATH) as f:
+                _config_cache = json.load(f)
+            _config_mtime = mt
+        return _config_cache
 
 
 CFG = load_config()
@@ -34,8 +53,8 @@ CFG = load_config()
 LISTEN_HOST = CFG.get("listen_host", "0.0.0.0")
 LISTEN_PORT = CFG.get("listen_port", 18081)
 ANTHROPIC_API_BASE = "https://api.anthropic.com"
-OAUTH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), CFG.get("oauth_file", "oauth.json"))
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), CFG.get("db_path", "cc-proxy.db"))
+OAUTH_FILE = os.path.join(BASE_DIR, CFG.get("oauth_file", "oauth.json"))
+DB_PATH = os.path.join(BASE_DIR, CFG.get("db_path", "cc-proxy.db"))
 
 CC_VERSION = "2.1.92"
 FINGERPRINT_SALT = "59cf53e54c78"
@@ -52,33 +71,34 @@ BETAS = [
     "context-management-2025-06-27",
 ]
 
+UPSTREAM_TIMEOUT = httpx.Timeout(connect=15.0, read=330.0, write=30.0, pool=15.0)
+CLI_USER_AGENT = f"claude-cli/{CC_VERSION} ({USER_TYPE}, {CC_ENTRYPOINT})"
+
 
 # ─── 持久 device_id ───
 
-def _load_or_create_device_id(path):
-    ids_file = os.path.join(path, ".cc_proxy_ids.json")
+def _load_or_create_device_id():
+    ids_file = os.path.join(BASE_DIR, ".cc_proxy_ids.json")
     if os.path.exists(ids_file):
         with open(ids_file) as f:
             return json.load(f).get("device_id", os.urandom(32).hex())
     device_id = os.urandom(32).hex()
-    os.makedirs(path, exist_ok=True)
     with open(ids_file, "w") as f:
         json.dump({"device_id": device_id}, f)
     return device_id
 
 
-DEVICE_ID = _load_or_create_device_id(os.path.dirname(os.path.abspath(__file__)))
+DEVICE_ID = _load_or_create_device_id()
 
 
-# ─── API Key 验证 ───
+# ─── API Key 验证（常数时间比较）───
 
 def validate_api_key(headers):
-    """从请求 headers 中提取并验证 API Key，返回 (key_name, error_msg)"""
-    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    auth = headers.get("authorization") or ""
     api_key = headers.get("x-api-key") or ""
 
     token = ""
-    if auth.startswith("Bearer "):
+    if auth.lower().startswith("bearer "):
         token = auth[7:].strip()
     elif api_key:
         token = api_key.strip()
@@ -88,66 +108,123 @@ def validate_api_key(headers):
 
     cfg = load_config()
     for name, key in cfg.get("api_keys", {}).items():
-        if key == token:
+        if hmac.compare_digest(key, token):
             return name, None
 
     return None, "Invalid API key"
 
 
-# ─── OAuth token 管理 ───
+# ─── OAuth token 管理（带缓存）───
 
-_token_lock = threading.Lock()
+_oauth_lock = asyncio.Lock()
+_oauth_cache = None
+_oauth_mtime = 0
+
+
+def _load_oauth_sync():
+    global _oauth_cache, _oauth_mtime
+    try:
+        mt = os.path.getmtime(OAUTH_FILE)
+    except OSError:
+        mt = 0
+    if _oauth_cache is None or mt != _oauth_mtime:
+        with open(OAUTH_FILE) as f:
+            _oauth_cache = json.load(f)
+        _oauth_mtime = mt
+    return _oauth_cache
+
+
+def _save_oauth_sync(data):
+    global _oauth_cache, _oauth_mtime
+    tmp = OAUTH_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, OAUTH_FILE)
+    _oauth_cache = data
+    try:
+        _oauth_mtime = os.path.getmtime(OAUTH_FILE)
+    except OSError:
+        _oauth_mtime = 0
+
+
+# 同步版本供 tgbot 使用
+_sync_token_lock = threading.Lock()
 
 
 def _load_oauth():
-    with open(OAUTH_FILE) as f:
-        return json.load(f)
+    return _load_oauth_sync()
 
 
 def _save_oauth(data):
-    with open(OAUTH_FILE, "w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    with _sync_token_lock:
+        _save_oauth_sync(data)
 
 
 def _refresh_token(oauth_data):
-    print(f"[OAuth] Refreshing token...")
-    resp = requests.post(
-        "https://platform.claude.com/v1/oauth/token",
-        json={
-            "grant_type": "refresh_token",
-            "refresh_token": oauth_data["refresh_token"],
-            "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-            "scope": "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
-        },
-        headers={"Content-Type": "application/json"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    token_data = resp.json()
-    oauth_data["access_token"] = token_data["access_token"]
-    if "refresh_token" in token_data:
-        oauth_data["refresh_token"] = token_data["refresh_token"]
-    expires_in = token_data.get("expires_in", 28800)
-    expired_dt = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-    oauth_data["expired"] = expired_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    oauth_data["last_refresh"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    _save_oauth(oauth_data)
-    print(f"[OAuth] Token refreshed, expires at {oauth_data['expired']}")
-    return oauth_data["access_token"]
+    """刷新 OAuth token — 使用 _sync_token_lock 序列化所有调用者（async + tgbot）"""
+    with _sync_token_lock:
+        print("[OAuth] Refreshing token...")
+        resp = httpx.post(
+            "https://platform.claude.com/v1/oauth/token",
+            json={
+                "grant_type": "refresh_token",
+                "refresh_token": oauth_data["refresh_token"],
+                "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                "scope": "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
+            },
+            headers={"Content-Type": "application/json", "User-Agent": CLI_USER_AGENT},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        token_data = resp.json()
+        oauth_data["access_token"] = token_data["access_token"]
+        if "refresh_token" in token_data:
+            oauth_data["refresh_token"] = token_data["refresh_token"]
+        expires_in = token_data.get("expires_in", 28800)
+        expired_dt = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        oauth_data["expired"] = expired_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        oauth_data["last_refresh"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _save_oauth_sync(oauth_data)
+        print(f"[OAuth] Token refreshed, expires at {oauth_data['expired']}")
+        return oauth_data["access_token"]
 
 
-def get_access_token():
-    with _token_lock:
-        oauth_data = _load_oauth()
+async def get_access_token():
+    async with _oauth_lock:
+        oauth_data = _load_oauth_sync()
         expired_str = oauth_data.get("expired", "")
         if expired_str:
             try:
                 expired_dt = datetime.fromisoformat(expired_str.replace("Z", "+00:00"))
                 if (expired_dt - datetime.now(timezone.utc)).total_seconds() < 300:
-                    return _refresh_token(oauth_data)
+                    try:
+                        return await asyncio.to_thread(_refresh_token, oauth_data)
+                    except Exception as e:
+                        tgbot.notify_admins(f"⚠️ OAuth 自动刷新失败: {e}")
+                        raise
             except Exception:
-                return _refresh_token(oauth_data)
+                try:
+                    return await asyncio.to_thread(_refresh_token, oauth_data)
+                except Exception as e:
+                    tgbot.notify_admins(f"⚠️ OAuth 自动刷新失败: {e}")
+                    raise
         return oauth_data["access_token"]
+
+
+def get_access_token_sync():
+    """同步版本供 tgbot 使用"""
+    oauth_data = _load_oauth_sync()
+    expired_str = oauth_data.get("expired", "")
+    if expired_str:
+        try:
+            expired_dt = datetime.fromisoformat(expired_str.replace("Z", "+00:00"))
+            if (expired_dt - datetime.now(timezone.utc)).total_seconds() < 300:
+                return _refresh_token(oauth_data)  # _refresh_token 内部持有 _sync_token_lock
+        except Exception:
+            return _refresh_token(oauth_data)
+    return oauth_data["access_token"]
 
 
 # ─── Fingerprint ───
@@ -237,11 +314,11 @@ def add_cache_breakpoints(messages):
     return messages
 
 
-# ─── Metadata ───
+# ─── Metadata（使用缓存的 oauth）───
 
 def build_metadata():
     try:
-        email = _load_oauth().get("email", "")
+        email = _load_oauth_sync().get("email", "")
         account_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, email)) if email else ""
     except Exception:
         account_uuid = ""
@@ -297,7 +374,6 @@ def transform_request(body):
         budget = min(max_out - 1, 10000)
         if budget >= 1024:
             payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
-        # budget < 1024 时不启用 thinking（API 要求最少 1024）
 
     if body.get("tools"):
         tools = [dict(t) for t in body["tools"]]
@@ -342,216 +418,79 @@ def build_upstream_headers(access_token):
         "anthropic-version": "2023-06-01",
         "anthropic-beta": ",".join(BETAS),
         "x-app": "cli",
-        "User-Agent": f"claude-cli/{CC_VERSION} ({USER_TYPE}, {CC_ENTRYPOINT})",
+        "User-Agent": CLI_USER_AGENT,
         "x-client-request-id": str(uuid.uuid4()),
     }
 
 
-# ─── SSE 流解析（提取 usage）───
+# ─── SSE 流式 usage 解析器（流式提取，不存全量）───
 
-def _parse_sse_usage(sse_text):
-    """从完整的 SSE 文本中提取 usage 信息"""
-    usage = {"input_tokens": 0, "output_tokens": 0, "cache_creation": 0, "cache_read": 0}
-    for line in sse_text.split("\n"):
-        if not line.startswith("data:"):
-            continue
-        data = line[5:].strip()
-        if data == "[DONE]":
-            break
-        try:
-            evt = json.loads(data)
-        except Exception:
-            continue
-        t = evt.get("type", "")
-        if t == "message_start":
-            u = evt.get("message", {}).get("usage", {})
-            usage["input_tokens"] = u.get("input_tokens", 0)
-            usage["cache_creation"] = u.get("cache_creation_input_tokens", 0)
-            usage["cache_read"] = u.get("cache_read_input_tokens", 0)
-        elif t == "message_delta":
-            u = evt.get("usage", {})
-            usage["output_tokens"] = u.get("output_tokens", 0)
-    return usage
+class SSEUsageTracker:
+    """从 SSE 流中实时提取 usage，同时收集完整响应用于 DB 存储。
+    使用行缓冲处理跨 chunk 的 JSON 事件。"""
 
+    def __init__(self):
+        self.usage = {"input_tokens": 0, "output_tokens": 0, "cache_creation": 0, "cache_read": 0}
+        self._chunks = []
+        self._buf = b""
 
-# ─── HTTP Handler ───
-
-class ProxyHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        if self.path not in ("/v1/messages", "/v1/messages?beta=true"):
-            self._json_response(404, {"error": "not_found"})
-            return
-
-        t_start = time.time()
-        request_id = str(uuid.uuid4())
-        client_ip = self.client_address[0] if self.client_address else "?"
-
-        # API Key 验证
-        key_name, err = validate_api_key(self.headers)
-        if err:
-            self._json_response(401, {"error": err})
-            return
-
-        # 读取请求体
-        content_length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(content_length) if content_length > 0 else b""
-        try:
-            body = json.loads(raw)
-        except Exception as e:
-            self._json_response(400, {"error": f"invalid json: {e}"})
-            return
-
-        model = body.get("model", "?")
-        is_stream = body.get("stream", True)
-        msg_count = len(body.get("messages", []))
-        tool_count = len(body.get("tools", []))
-
-        # 记录请求头（脱敏）
-        req_headers = dict(self.headers)
-        for h in ("Authorization", "authorization", "x-api-key"):
-            if h in req_headers:
-                req_headers[h] = "***"
-
-        # 写入 pending 日志
-        db.insert_pending(request_id, client_ip, key_name, model, is_stream,
-                          msg_count, tool_count, req_headers, body)
-
-        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        print(f"[{ts}] {client_ip} {key_name} -> {model} | msgs={msg_count} tools={tool_count}")
-
-        # 转换请求
-        try:
-            payload = transform_request(body)
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            db.finish_error(request_id, str(e), 0, int((time.time() - t_start) * 1000))
-            self._json_response(500, {"error": f"transform error: {e}"})
-            return
-
-        # 获取 token
-        try:
-            access_token = get_access_token()
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            db.finish_error(request_id, f"oauth: {e}", 0, int((time.time() - t_start) * 1000))
-            self._json_response(502, {"error": f"oauth error: {e}"})
-            return
-
-        headers = build_upstream_headers(access_token)
-        signed_body = sign_body(payload)
-
-        # 转发
-        t_connect_start = time.time()
-        try:
-            resp = requests.post(
-                f"{ANTHROPIC_API_BASE}/v1/messages?beta=true",
-                headers=headers, data=signed_body, stream=True, timeout=(15, 600),
-            )
-            t_connected = time.time()
-            connect_ms = int((t_connected - t_connect_start) * 1000)
-
-            if resp.status_code >= 400:
-                err_body = resp.text[:4000]
-                total_ms = int((time.time() - t_start) * 1000)
-                db.finish_error(request_id, f"HTTP {resp.status_code}: {err_body}", connect_ms, total_ms, err_body)
-                self.send_response(resp.status_code)
-                self.send_header("Content-Type", resp.headers.get("content-type", "application/json"))
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                restored = _restore_tool_names_in_chunk(err_body.encode())
-                self.wfile.write(restored)
-                return
-
-            # 透传
-            self.send_response(resp.status_code)
-            for h in ("content-type", "x-request-id", "request-id"):
-                if h in resp.headers:
-                    self.send_header(h, resp.headers[h])
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-
-            full_response = b""
-            first_chunk = True
-            t_first_token = None
-
-            for chunk in resp.iter_content(chunk_size=None):
-                if chunk:
-                    if first_chunk:
-                        t_first_token = time.time()
-                        first_chunk = False
-                    restored = _restore_tool_names_in_chunk(chunk)
-                    full_response += restored
-                    self.wfile.write(restored)
-                    self.wfile.flush()
-
-            # 解析 usage
-            total_ms = int((time.time() - t_start) * 1000)
-            first_token_ms = int((t_first_token - t_start) * 1000) if t_first_token else None
-            usage = _parse_sse_usage(full_response.decode("utf-8", errors="replace"))
-
-            db.finish_success(
-                request_id,
-                input_tokens=usage["input_tokens"],
-                output_tokens=usage["output_tokens"],
-                cache_creation=usage["cache_creation"],
-                cache_read=usage["cache_read"],
-                connect_ms=connect_ms,
-                first_token_ms=first_token_ms,
-                total_ms=total_ms,
-                response_body=full_response.decode("utf-8", errors="replace")[:500000],
-            )
-
-        except requests.Timeout:
-            total_ms = int((time.time() - t_start) * 1000)
-            db.finish_error(request_id, "upstream timeout", None, total_ms)
-            self._json_response(504, {"error": "upstream timeout"})
-        except requests.ConnectionError as e:
-            total_ms = int((time.time() - t_start) * 1000)
-            db.finish_error(request_id, f"connection error: {e}", None, total_ms)
-            self._json_response(502, {"error": f"upstream connection error: {e}"})
-        except Exception as e:
-            total_ms = int((time.time() - t_start) * 1000)
-            db.finish_error(request_id, str(e), None, total_ms)
+    def feed(self, chunk_bytes):
+        self._chunks.append(chunk_bytes)
+        self._buf += chunk_bytes
+        # 按行处理，保留不完整的尾行到下次
+        while b"\n" in self._buf:
+            line_bytes, self._buf = self._buf.split(b"\n", 1)
+            line = line_bytes.decode("utf-8", errors="replace")
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
             try:
-                self._json_response(502, {"error": str(e)})
+                evt = json.loads(data)
             except Exception:
-                pass
+                continue
+            t = evt.get("type", "")
+            if t == "message_start":
+                u = evt.get("message", {}).get("usage", {})
+                self.usage["input_tokens"] = u.get("input_tokens", 0)
+                self.usage["cache_creation"] = u.get("cache_creation_input_tokens", 0)
+                self.usage["cache_read"] = u.get("cache_read_input_tokens", 0)
+            elif t == "message_delta":
+                u = evt.get("usage", {})
+                self.usage["output_tokens"] = u.get("output_tokens", 0)
 
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.end_headers()
-
-    def _json_response(self, code, data):
-        body = json.dumps(data, ensure_ascii=False).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, fmt, *args):
-        pass
+    def get_full_response(self):
+        """返回完整响应文本，不截断"""
+        return b"".join(self._chunks).decode("utf-8", errors="replace")
 
 
-# ─── 启动 ───
+# ─── FastAPI 应用 ───
 
-def main():
-    # 初始化数据库
+_http_client = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _http_client
+    # 启动
     db.init(DB_PATH)
+    db.cleanup_stale_pending(timeout_seconds=600)
 
-    # 初始化 TG Bot
+    _http_client = httpx.AsyncClient(
+        timeout=UPSTREAM_TIMEOUT,
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        http2=False,
+    )
+
     tg_token = CFG.get("telegram_bot_token", "")
     tg_admins = CFG.get("telegram_admin_ids", [])
     if tg_token:
         tgbot.init(tg_token, tg_admins, CONFIG_PATH,
-                    get_access_token, _refresh_token, _load_oauth, _save_oauth)
+                    get_access_token_sync, _refresh_token, _load_oauth, _save_oauth)
         tgbot.start()
 
-    print(f"CC Proxy v2.0 | claude-cli/{CC_VERSION}")
+    print(f"CC Proxy v3.0 | claude-cli/{CC_VERSION}")
     print(f"  device_id: {DEVICE_ID[:16]}...")
     print(f"  betas: {len(BETAS)}")
     print(f"  api_keys: {len(CFG.get('api_keys', {}))}")
@@ -561,12 +500,195 @@ def main():
     print(f"Listening on http://{LISTEN_HOST}:{LISTEN_PORT}/v1/messages")
     print()
 
-    server = HTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
+    # 启动定期 WAL checkpoint
+    async def wal_checkpoint_loop():
+        while True:
+            await asyncio.sleep(300)
+            try:
+                db.checkpoint()
+            except Exception as e:
+                print(f"[DB] WAL checkpoint failed: {e}")
+
+    _wal_task = asyncio.create_task(wal_checkpoint_loop())
+
+    yield
+
+    # 关闭
+    _wal_task.cancel()
+    await _http_client.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.post("/v1/messages")
+async def proxy_messages(request: Request):
+    t_start = time.time()
+    request_id = str(uuid.uuid4())
+    client_ip = request.client.host if request.client else "?"
+
+    # API Key 验证
+    key_name, err = validate_api_key(request.headers)
+    if err:
+        return JSONResponse(status_code=401, content={"error": err})
+
+    # 读取请求体
+    raw = await request.body()
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down.")
-        server.server_close()
+        body = json.loads(raw)
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": f"invalid json: {e}"})
+
+    model = body.get("model", "?")
+    is_stream = body.get("stream", True)
+    msg_count = len(body.get("messages", []))
+    tool_count = len(body.get("tools", []))
+
+    # 记录请求头（脱敏）
+    req_headers = dict(request.headers)
+    for h in ("authorization", "x-api-key"):
+        if h in req_headers:
+            req_headers[h] = "***"
+
+    # 写入 pending 日志
+    await asyncio.to_thread(db.insert_pending, request_id, client_ip, key_name, model, is_stream,
+                            msg_count, tool_count, req_headers, body)
+
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print(f"[{ts}] {client_ip} {key_name} -> {model} | msgs={msg_count} tools={tool_count}")
+
+    # 转换请求
+    try:
+        payload = transform_request(body)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        await asyncio.to_thread(db.finish_error, request_id, str(e), 0, int((time.time() - t_start) * 1000))
+        return JSONResponse(status_code=500, content={"error": f"transform error: {e}"})
+
+    # 获取 token
+    try:
+        access_token = await get_access_token()
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        await asyncio.to_thread(db.finish_error, request_id, f"oauth: {e}", 0, int((time.time() - t_start) * 1000))
+        return JSONResponse(status_code=502, content={"error": f"oauth error: {e}"})
+
+    headers = build_upstream_headers(access_token)
+    signed_body = sign_body(payload)
+
+    # 转发（异步流式）
+    t_connect_start = time.time()
+    try:
+        upstream_req = _http_client.build_request(
+            "POST",
+            f"{ANTHROPIC_API_BASE}/v1/messages?beta=true",
+            headers=headers,
+            content=signed_body,
+        )
+        upstream_resp = await _http_client.send(upstream_req, stream=True)
+        t_connected = time.time()
+        connect_ms = int((t_connected - t_connect_start) * 1000)
+
+        if upstream_resp.status_code >= 400:
+            err_body = (await upstream_resp.aread()).decode("utf-8", errors="replace")
+            await upstream_resp.aclose()
+            total_ms = int((time.time() - t_start) * 1000)
+            await asyncio.to_thread(db.finish_error, request_id,
+                                    f"HTTP {upstream_resp.status_code}: {err_body[:4000]}",
+                                    connect_ms, total_ms, err_body)
+            restored = _restore_tool_names_in_chunk(err_body.encode())
+            return StreamingResponse(
+                iter([restored]),
+                status_code=upstream_resp.status_code,
+                media_type=upstream_resp.headers.get("content-type", "application/json"),
+            )
+
+        # 构建流式响应
+        tracker = SSEUsageTracker()
+
+        async def stream_generator():
+            first_chunk = True
+            t_first_token = None
+            completed = False
+            try:
+                async for chunk in upstream_resp.aiter_bytes():
+                    if chunk:
+                        if first_chunk:
+                            t_first_token = time.time()
+                            first_chunk = False
+                        restored = _restore_tool_names_in_chunk(chunk)
+                        tracker.feed(restored)
+                        yield restored
+                completed = True
+            except BaseException as e:
+                # 捕获 CancelledError/GeneratorExit（客户端断连）和普通异常
+                total_ms = int((time.time() - t_start) * 1000)
+                err_type = type(e).__name__
+                await asyncio.to_thread(db.finish_error, request_id,
+                                        f"stream {err_type}: {e}", connect_ms, total_ms)
+                return
+            finally:
+                await upstream_resp.aclose()
+
+            if completed:
+                # 流完成，记录成功
+                total_ms = int((time.time() - t_start) * 1000)
+                first_token_ms = int((t_first_token - t_start) * 1000) if t_first_token else None
+                await asyncio.to_thread(
+                    db.finish_success,
+                    request_id,
+                    input_tokens=tracker.usage["input_tokens"],
+                    output_tokens=tracker.usage["output_tokens"],
+                    cache_creation=tracker.usage["cache_creation"],
+                    cache_read=tracker.usage["cache_read"],
+                    connect_ms=connect_ms,
+                    first_token_ms=first_token_ms,
+                    total_ms=total_ms,
+                    response_body=tracker.get_full_response(),
+                )
+
+        resp_headers = {}
+        for h in ("content-type", "x-request-id", "request-id"):
+            if h in upstream_resp.headers:
+                resp_headers[h] = upstream_resp.headers[h]
+
+        return StreamingResponse(
+            stream_generator(),
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+        )
+
+    except httpx.TimeoutException:
+        total_ms = int((time.time() - t_start) * 1000)
+        await asyncio.to_thread(db.finish_error, request_id, "upstream timeout", None, total_ms)
+        return JSONResponse(status_code=504, content={"error": "upstream timeout"})
+    except httpx.ConnectError as e:
+        total_ms = int((time.time() - t_start) * 1000)
+        await asyncio.to_thread(db.finish_error, request_id, f"connection error: {e}", None, total_ms)
+        return JSONResponse(status_code=502, content={"error": f"upstream connection error: {e}"})
+    except Exception as e:
+        total_ms = int((time.time() - t_start) * 1000)
+        await asyncio.to_thread(db.finish_error, request_id, str(e), None, total_ms)
+        return JSONResponse(status_code=502, content={"error": str(e)})
+
+
+# ─── 启动 ───
+
+def main():
+    uvicorn.run(
+        app,
+        host=LISTEN_HOST,
+        port=LISTEN_PORT,
+        log_level="warning",
+        access_log=False,
+    )
 
 
 if __name__ == "__main__":

@@ -1,19 +1,28 @@
-"""SQLite 日志模块 — 两张表：request_log（轻量）+ request_detail（完整 body/响应）"""
+"""SQLite 日志模块 — 按月分库，两张表：request_log（轻量）+ request_detail（完整 body/响应）"""
 
 import sqlite3
 import threading
 import json
 import time
 import os
+from datetime import datetime, timezone, timedelta
 
 _local = threading.local()
-_db_path = None
+_db_dir = None       # DB 文件所在目录
+_db_prefix = None    # DB 文件名前缀（不含 .db）
+_current_month = None  # 当前月份 "YYYY-MM"
+_write_lock = threading.Lock()  # 序列化所有写操作，防止并发协程冲突
+
+_BJT = timezone(timedelta(hours=8))
 
 
-def init(path):
-    global _db_path
-    _db_path = path
-    conn = _get_conn()
+def _current_db_path():
+    """返回当前月份的 DB 文件路径"""
+    month = datetime.now(_BJT).strftime("%Y-%m")
+    return os.path.join(_db_dir, f"{_db_prefix}-{month}.db"), month
+
+
+def _init_schema(conn):
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS request_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,76 +62,130 @@ def init(path):
     conn.commit()
 
 
+def init(path):
+    """初始化 DB 模块。path 是原始 db 路径如 /opt/cc-proxy/cc-proxy.db，
+    实际文件名会按月后缀，如 cc-proxy-2026-04.db"""
+    global _db_dir, _db_prefix, _current_month
+    _db_dir = os.path.dirname(path)
+    # 从 "cc-proxy.db" 提取 "cc-proxy"
+    base = os.path.basename(path)
+    if base.endswith(".db"):
+        _db_prefix = base[:-3]
+    else:
+        _db_prefix = base
+    # 初始化当前月的 DB
+    conn = _get_conn()
+    print(f"[DB] Using {_current_db_path()[0]}")
+
+
 def _get_conn():
-    if not hasattr(_local, "conn") or _local.conn is None:
-        _local.conn = sqlite3.connect(_db_path, timeout=10)
+    global _current_month
+    db_path, month = _current_db_path()
+    # 检查是否需要切换到新月份的 DB
+    need_new = (not hasattr(_local, "conn") or _local.conn is None
+                or _local.month != month)
+    if need_new:
+        # 关闭旧连接
+        if hasattr(_local, "conn") and _local.conn is not None:
+            try:
+                _local.conn.close()
+            except Exception:
+                pass
+        _local.conn = sqlite3.connect(db_path, timeout=10)
         _local.conn.row_factory = sqlite3.Row
         _local.conn.execute("PRAGMA journal_mode=WAL")
         _local.conn.execute("PRAGMA busy_timeout=5000")
+        _local.month = month
+        _current_month = month
+        _init_schema(_local.conn)
     return _local.conn
 
 
 def insert_pending(request_id, client_ip, api_key_name, model, is_stream,
                    msg_count, tool_count, request_headers, request_body):
     """请求发起时立即记录（状态 pending）"""
-    conn = _get_conn()
-    now = time.time()
-    conn.execute(
-        """INSERT INTO request_log
-           (request_id, created_at, client_ip, api_key_name, model, status,
-            is_stream, msg_count, tool_count)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
-        (request_id, now, client_ip, api_key_name, model, "pending",
-         1 if is_stream else 0, msg_count, tool_count),
-    )
-    conn.execute(
-        """INSERT INTO request_detail (request_id, request_headers, request_body)
-           VALUES (?,?,?)""",
-        (request_id,
-         json.dumps(request_headers, ensure_ascii=False) if request_headers else None,
-         json.dumps(request_body, ensure_ascii=False) if request_body else None),
-    )
-    conn.commit()
+    with _write_lock:
+        conn = _get_conn()
+        now = time.time()
+        conn.execute(
+            """INSERT INTO request_log
+               (request_id, created_at, client_ip, api_key_name, model, status,
+                is_stream, msg_count, tool_count)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (request_id, now, client_ip, api_key_name, model, "pending",
+             1 if is_stream else 0, msg_count, tool_count),
+        )
+        conn.execute(
+            """INSERT INTO request_detail (request_id, request_headers, request_body)
+               VALUES (?,?,?)""",
+            (request_id,
+             json.dumps(request_headers, ensure_ascii=False) if request_headers else None,
+             json.dumps(request_body, ensure_ascii=False) if request_body else None),
+        )
+        conn.commit()
 
 
 def finish_success(request_id, input_tokens, output_tokens, cache_creation,
                    cache_read, connect_ms, first_token_ms, total_ms, response_body):
-    """请求成功完成"""
-    conn = _get_conn()
-    now = time.time()
-    conn.execute(
-        """UPDATE request_log SET
-           status='success', finished_at=?, input_tokens=?, output_tokens=?,
-           cache_creation_tokens=?, cache_read_tokens=?,
-           connect_time_ms=?, first_token_time_ms=?, total_time_ms=?
-           WHERE request_id=?""",
-        (now, input_tokens, output_tokens, cache_creation, cache_read,
-         connect_ms, first_token_ms, total_ms, request_id),
-    )
-    conn.execute(
-        "UPDATE request_detail SET response_body=? WHERE request_id=?",
-        (response_body, request_id),
-    )
-    conn.commit()
-
-
-def finish_error(request_id, error_message, connect_ms, total_ms, response_body=None):
-    """请求失败"""
-    conn = _get_conn()
-    now = time.time()
-    conn.execute(
-        """UPDATE request_log SET
-           status='error', finished_at=?, error_message=?,
-           connect_time_ms=?, total_time_ms=?
-           WHERE request_id=?""",
-        (now, error_message[:4000] if error_message else None, connect_ms, total_ms, request_id),
-    )
-    if response_body:
+    """请求成功完成 — response_body 完整存储，不截断"""
+    with _write_lock:
+        conn = _get_conn()
+        now = time.time()
+        conn.execute(
+            """UPDATE request_log SET
+               status='success', finished_at=?, input_tokens=?, output_tokens=?,
+               cache_creation_tokens=?, cache_read_tokens=?,
+               connect_time_ms=?, first_token_time_ms=?, total_time_ms=?
+               WHERE request_id=?""",
+            (now, input_tokens, output_tokens, cache_creation, cache_read,
+             connect_ms, first_token_ms, total_ms, request_id),
+        )
         conn.execute(
             "UPDATE request_detail SET response_body=? WHERE request_id=?",
             (response_body, request_id),
         )
-    conn.commit()
+        conn.commit()
+
+
+def finish_error(request_id, error_message, connect_ms, total_ms, response_body=None):
+    """请求失败 — error_message 不截断"""
+    with _write_lock:
+        conn = _get_conn()
+        now = time.time()
+        conn.execute(
+            """UPDATE request_log SET
+               status='error', finished_at=?, error_message=?,
+               connect_time_ms=?, total_time_ms=?
+               WHERE request_id=?""",
+            (now, error_message, connect_ms, total_ms, request_id),
+        )
+        if response_body:
+            conn.execute(
+                "UPDATE request_detail SET response_body=? WHERE request_id=?",
+                (response_body, request_id),
+            )
+        conn.commit()
+
+
+def cleanup_stale_pending(timeout_seconds=600):
+    """启动时清理因进程崩溃遗留的 pending 记录"""
+    with _write_lock:
+        conn = _get_conn()
+        cutoff = time.time() - timeout_seconds
+        count = conn.execute(
+            """UPDATE request_log SET status='error', error_message='process crashed (stale pending)',
+               finished_at=? WHERE status='pending' AND created_at < ?""",
+            (time.time(), cutoff),
+        ).rowcount
+        conn.commit()
+        if count:
+            print(f"[DB] Cleaned up {count} stale pending records")
+
+
+def checkpoint():
+    """执行 WAL checkpoint，控制 WAL 文件大小"""
+    conn = _get_conn()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
 
 # ─── 查询 ───
@@ -166,4 +229,18 @@ def stats_summary(since_ts):
         (since_ts,),
     ).fetchall()
 
-    return row, recent_errors
+    # 按 API Key 分组统计
+    per_key = conn.execute(
+        """SELECT api_key_name,
+             COUNT(*) as total,
+             SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success_count,
+             SUM(input_tokens) as input_tokens,
+             SUM(output_tokens) as output_tokens,
+             SUM(cache_creation_tokens) as cache_creation,
+             SUM(cache_read_tokens) as cache_read
+           FROM request_log WHERE created_at >= ?
+           GROUP BY api_key_name ORDER BY total DESC""",
+        (since_ts,),
+    ).fetchall()
+
+    return row, recent_errors, per_key

@@ -9,8 +9,12 @@ import base64
 import threading
 import traceback
 from datetime import datetime, timezone, timedelta
+
+_BJT = timezone(timedelta(hours=8))  # 北京时间 UTC+8
 from urllib.request import Request, urlopen
 from urllib.error import URLError
+
+import httpx
 
 import db
 
@@ -31,7 +35,9 @@ _refresh_fn = None         # 由 server.py 注入
 _load_oauth = None
 _save_oauth = None
 _offset = 0
-_user_states = {}          # chat_id -> {"action": ..., "data": ...}
+_user_states = {}          # chat_id -> {"action": ..., "data": ..., "ts": time.time()}
+_USER_STATE_TTL = 600      # 10 分钟过期
+_tg_session = None         # httpx 持久连接
 
 
 def init(bot_token, admin_ids, config_path, get_token_fn, refresh_fn, load_oauth_fn, save_oauth_fn):
@@ -48,6 +54,8 @@ def init(bot_token, admin_ids, config_path, get_token_fn, refresh_fn, load_oauth
 def start():
     if not _bot_token:
         return
+    global _tg_session
+    _tg_session = httpx.Client(timeout=30, http2=False)
     # 注册 Bot 命令菜单
     _api("setMyCommands", {
         "commands": [
@@ -64,18 +72,25 @@ def start():
     print(f"[TG Bot] Started polling, commands registered")
 
 
-# ─── Telegram API ───
+# ─── Telegram API（httpx 持久连接）───
 
 def _api(method, data=None):
     url = f"https://api.telegram.org/bot{_bot_token}/{method}"
-    body = json.dumps(data).encode() if data else None
-    req = Request(url, data=body, headers={"Content-Type": "application/json"} if body else {})
     try:
-        with urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except URLError as e:
+        if data:
+            resp = _tg_session.post(url, json=data)
+        else:
+            resp = _tg_session.get(url)
+        return resp.json()
+    except Exception as e:
         print(f"[TG Bot] API error: {e}")
         return None
+
+
+def notify_admins(text):
+    """向所有管理员发送通知"""
+    for admin_id in _admin_ids:
+        _send(admin_id, text)
 
 
 def _send(chat_id, text, reply_markup=None, parse_mode="HTML"):
@@ -112,8 +127,12 @@ def _load_config():
 
 
 def _save_config(cfg):
-    with open(_config_path, "w") as f:
+    tmp = _config_path + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, _config_path)
 
 
 # ─── Main menu ───
@@ -144,7 +163,7 @@ def _handle_apikey_menu(chat_id, msg_id, cb_id):
 
 def _handle_ak_add(chat_id, msg_id, cb_id):
     _answer_cb(cb_id)
-    _user_states[chat_id] = {"action": "ak_add_name"}
+    _user_states[chat_id] = {"action": "ak_add_name", "ts": time.time()}
     _edit(chat_id, msg_id, "请输入新 API Key 的名称（如: my-app）：")
 
 
@@ -201,7 +220,7 @@ def _handle_oauth_menu(chat_id, msg_id, cb_id):
     try:
         oauth = _load_oauth()
         email = oauth.get("email", "?")
-        expired = oauth.get("expired", "?")
+        expired = _utc_to_bjt(oauth.get("expired", ""))
         text = f"<b>OAuth 管理</b>\nEmail: <code>{email}</code>\n过期: <code>{expired}</code>"
     except Exception:
         text = "<b>OAuth 管理</b>\n⚠️ 未配置 OAuth"
@@ -278,6 +297,7 @@ def _handle_oa_login(chat_id, msg_id, cb_id):
     _user_states[chat_id] = {
         "action": "oa_login_code",
         "data": {"code_verifier": code_verifier, "state": state},
+        "ts": time.time(),
     }
     _edit(chat_id, msg_id,
           "请在浏览器中打开以下链接并登录：\n\n"
@@ -287,6 +307,10 @@ def _handle_oa_login(chat_id, msg_id, cb_id):
 
 def _handle_oa_login_code(chat_id, text):
     state_data = _user_states.pop(chat_id, {}).get("data", {})
+    if "code_verifier" not in state_data:
+        _send(chat_id, "❌ 登录会话已过期，请重新点击「登录获取 Token」。")
+        _show_menu(chat_id)
+        return
     raw = text.strip()
     if not raw:
         _send(chat_id, "❌ code 不能为空，请重新操作。")
@@ -332,13 +356,13 @@ def _handle_oa_login_code(chat_id, text):
     _send(chat_id,
           f"✅ OAuth 登录成功！\n\n"
           f"Email: <code>{email or '未知'}</code>\n"
-          f"过期: <code>{oauth_data['expired']}</code>")
+          f"过期: <code>{_utc_to_bjt(oauth_data['expired'])}</code>")
     _show_menu(chat_id)
 
 
 def _handle_oa_set(chat_id, msg_id, cb_id):
     _answer_cb(cb_id)
-    _user_states[chat_id] = {"action": "oa_set_json"}
+    _user_states[chat_id] = {"action": "oa_set_json", "ts": time.time()}
     _edit(chat_id, msg_id, "请输入 OAuth JSON（含 access_token, refresh_token, expired, email）：")
 
 
@@ -368,14 +392,15 @@ def _handle_oa_refresh(chat_id, msg_id, cb_id):
             remaining = (expired_dt - dt.now(timezone.utc)).total_seconds()
             if remaining > 300:
                 _edit(chat_id, msg_id,
-                      f"Token 仍有效，剩余 {int(remaining//60)} 分钟\n过期: <code>{expired_str}</code>",
+                      f"Token 仍有效，剩余 {int(remaining//60)} 分钟\n过期: <code>{_utc_to_bjt(expired_str)}</code>",
                       _inline_kb([
                           [{"text": "🔄 强制刷新", "callback_data": "oa_force_refresh"}],
                           [{"text": "◀ 返回", "callback_data": "menu_oauth"}],
                       ]))
                 return
-        token = _refresh_fn(oauth)
-        _edit(chat_id, msg_id, f"✅ Token 已刷新\n新过期: <code>{oauth.get('expired', '?')}</code>")
+        _refresh_fn(oauth)
+        oauth = _load_oauth()
+        _edit(chat_id, msg_id, f"✅ Token 已刷新\n新过期: <code>{_utc_to_bjt(oauth.get('expired', ''))}</code>")
     except Exception as e:
         _edit(chat_id, msg_id, f"❌ 刷新失败: {e}")
     _show_menu(chat_id)
@@ -386,7 +411,8 @@ def _handle_oa_force_refresh(chat_id, msg_id, cb_id):
     try:
         oauth = _load_oauth()
         _refresh_fn(oauth)
-        _edit(chat_id, msg_id, f"✅ 强制刷新成功\n新过期: <code>{oauth.get('expired', '?')}</code>")
+        oauth = _load_oauth()  # 重新读取刷新后的数据
+        _edit(chat_id, msg_id, f"✅ 强制刷新成功\n新过期: <code>{_utc_to_bjt(oauth.get('expired', ''))}</code>")
     except Exception as e:
         _edit(chat_id, msg_id, f"❌ 刷新失败: {e}")
     _show_menu(chat_id)
@@ -406,14 +432,14 @@ def _handle_stats(chat_id, msg_id, cb_id, period):
         label = "所有时间"
     elif period == "0":
         # 今天 00:00 UTC
-        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        today = datetime.now(_BJT).replace(hour=0, minute=0, second=0, microsecond=0)
         since = today.timestamp()
         label = "今天"
     else:
         since = now - int(period) * 86400
         label = f"最近 {period} 天"
 
-    row, errors = db.stats_summary(since)
+    row, errors, per_key = db.stats_summary(since)
     total = row["total"] or 0
     text = f"<b>📊 统计 — {label}</b>\n\n"
     text += f"请求总数: {total}\n"
@@ -432,10 +458,16 @@ def _handle_stats(chat_id, msg_id, cb_id, period):
     text += f"  缓存写入: {row['total_cache_creation'] or 0}\n"
     text += f"  缓存读取: {row['total_cache_read'] or 0}\n"
 
+    if per_key and len(per_key) > 0:
+        text += f"\n<b>按 Key 统计:</b>\n"
+        for k in per_key:
+            name = k['api_key_name'] or '?'
+            text += f"  <code>{name}</code>: {k['total']}次 ✅{k['success_count'] or 0} 入{k['input_tokens'] or 0} 出{k['output_tokens'] or 0}\n"
+
     if errors:
         text += f"\n<b>最近失败 ({len(errors)} 条):</b>\n"
         for e in errors:
-            ts = datetime.fromtimestamp(e["created_at"], tz=timezone.utc).strftime("%m-%d %H:%M")
+            ts = datetime.fromtimestamp(e["created_at"], tz=_BJT).strftime("%m-%d %H:%M")
             text += f"\n<code>[{ts}]</code> {e['api_key_name'] or '?'} / {e['model'] or '?'}\n"
             err = (e["error_message"] or "")[:300]
             text += f"<pre>{_escape_html(err)}</pre>\n"
@@ -465,7 +497,7 @@ def _handle_logs(chat_id, msg_id, cb_id):
 
     text = "<b>📋 最近 20 条日志</b>\n"
     for r in rows:
-        ts = datetime.fromtimestamp(r["created_at"], tz=timezone.utc).strftime("%m-%d %H:%M:%S")
+        ts = datetime.fromtimestamp(r["created_at"], tz=_BJT).strftime("%m-%d %H:%M:%S")
         status_icon = {"success": "✅", "error": "❌", "pending": "⏳"}.get(r["status"], "?")
         line = f"\n<code>{ts}</code> {status_icon} <b>{r['api_key_name'] or '?'}</b> {r['model'] or '?'}"
         if r["connect_time_ms"] is not None:
@@ -490,6 +522,15 @@ def _handle_logs(chat_id, msg_id, cb_id):
 
 # ─── Utils ───
 
+def _utc_to_bjt(utc_str):
+    """将 UTC 时间字符串转为北京时间显示"""
+    if not utc_str:
+        return "?"
+    try:
+        return datetime.fromisoformat(utc_str.replace("Z", "+00:00")).astimezone(_BJT).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return utc_str
+
 def _escape_html(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -500,22 +541,41 @@ def _is_admin(chat_id):
 
 # ─── Polling ───
 
+def _cleanup_stale_states():
+    """清理超过 TTL 的 user states"""
+    now = time.time()
+    expired = [cid for cid, s in _user_states.items()
+               if now - s.get("ts", 0) > _USER_STATE_TTL]
+    for cid in expired:
+        _user_states.pop(cid, None)
+
+
 def _poll_loop():
     global _offset
+    fail_count = 0
+    cleanup_counter = 0
     while True:
         try:
             result = _api("getUpdates", {"offset": _offset, "timeout": 30})
             if not result or not result.get("ok"):
-                time.sleep(5)
+                fail_count += 1
+                time.sleep(min(5 * fail_count, 60))
                 continue
+            fail_count = 0
             for update in result.get("result", []):
                 _offset = update["update_id"] + 1
                 try:
                     _handle_update(update)
                 except Exception:
                     traceback.print_exc()
+            # 每 50 次 poll 清理一次过期 states
+            cleanup_counter += 1
+            if cleanup_counter >= 50:
+                cleanup_counter = 0
+                _cleanup_stale_states()
         except Exception:
-            time.sleep(5)
+            fail_count += 1
+            time.sleep(min(5 * fail_count, 60))
 
 
 def _handle_update(update):
@@ -627,7 +687,7 @@ def _handle_update(update):
             return
         txt = "<b>📋 最近 20 条日志</b>\n"
         for r in rows:
-            ts = datetime.fromtimestamp(r["created_at"], tz=timezone.utc).strftime("%m-%d %H:%M:%S")
+            ts = datetime.fromtimestamp(r["created_at"], tz=_BJT).strftime("%m-%d %H:%M:%S")
             icon = {"success": "✅", "error": "❌", "pending": "⏳"}.get(r["status"], "?")
             line = f"\n<code>{ts}</code> {icon} <b>{r['api_key_name'] or '?'}</b> {r['model'] or '?'}"
             if r["connect_time_ms"] is not None:
