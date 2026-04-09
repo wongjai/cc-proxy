@@ -7,3 +7,6 @@ __pycache__/
 oauth.json
 .cc_proxy_ids.json
 logs/
+config.json
+*.bak.*
+.codex

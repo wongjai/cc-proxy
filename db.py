@@ -43,7 +43,8 @@ def _init_schema(conn):
             cache_read_tokens INTEGER DEFAULT 0,
             connect_time_ms INTEGER,
             first_token_time_ms INTEGER,
-            total_time_ms INTEGER
+            total_time_ms INTEGER,
+            retry_count INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS request_detail (
@@ -59,7 +60,14 @@ def _init_schema(conn):
         CREATE INDEX IF NOT EXISTS idx_log_status ON request_log(status);
         CREATE INDEX IF NOT EXISTS idx_log_apikey ON request_log(api_key_name);
     """)
+    _ensure_schema_columns(conn)
     conn.commit()
+
+
+def _ensure_schema_columns(conn):
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(request_log)").fetchall()}
+    if "retry_count" not in cols:
+        conn.execute("ALTER TABLE request_log ADD COLUMN retry_count INTEGER DEFAULT 0")
 
 
 def init(path):
@@ -126,7 +134,8 @@ def insert_pending(request_id, client_ip, api_key_name, model, is_stream,
 
 
 def finish_success(request_id, input_tokens, output_tokens, cache_creation,
-                   cache_read, connect_ms, first_token_ms, total_ms, response_body):
+                   cache_read, connect_ms, first_token_ms, total_ms, response_body,
+                   retry_count=0):
     """请求成功完成 — response_body 完整存储，不截断"""
     with _write_lock:
         conn = _get_conn()
@@ -135,10 +144,10 @@ def finish_success(request_id, input_tokens, output_tokens, cache_creation,
             """UPDATE request_log SET
                status='success', finished_at=?, input_tokens=?, output_tokens=?,
                cache_creation_tokens=?, cache_read_tokens=?,
-               connect_time_ms=?, first_token_time_ms=?, total_time_ms=?
+               connect_time_ms=?, first_token_time_ms=?, total_time_ms=?, retry_count=?
                WHERE request_id=?""",
             (now, input_tokens, output_tokens, cache_creation, cache_read,
-             connect_ms, first_token_ms, total_ms, request_id),
+             connect_ms, first_token_ms, total_ms, retry_count, request_id),
         )
         conn.execute(
             "UPDATE request_detail SET response_body=? WHERE request_id=?",
@@ -147,7 +156,7 @@ def finish_success(request_id, input_tokens, output_tokens, cache_creation,
         conn.commit()
 
 
-def finish_error(request_id, error_message, connect_ms, total_ms, response_body=None):
+def finish_error(request_id, error_message, connect_ms, total_ms, response_body=None, retry_count=0):
     """请求失败 — error_message 不截断"""
     with _write_lock:
         conn = _get_conn()
@@ -155,9 +164,9 @@ def finish_error(request_id, error_message, connect_ms, total_ms, response_body=
         conn.execute(
             """UPDATE request_log SET
                status='error', finished_at=?, error_message=?,
-               connect_time_ms=?, total_time_ms=?
+               connect_time_ms=?, total_time_ms=?, retry_count=?
                WHERE request_id=?""",
-            (now, error_message, connect_ms, total_ms, request_id),
+            (now, error_message, connect_ms, total_ms, retry_count, request_id),
         )
         if response_body:
             conn.execute(
@@ -196,8 +205,22 @@ def recent_logs(limit=20):
         """SELECT request_id, created_at, client_ip, api_key_name, model, status,
                   is_stream, error_message, input_tokens, output_tokens,
                   cache_creation_tokens, cache_read_tokens,
-                  connect_time_ms, first_token_time_ms, total_time_ms
+                  connect_time_ms, first_token_time_ms, total_time_ms, retry_count
            FROM request_log ORDER BY created_at DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+
+
+def recent_success_logs(limit=3):
+    conn = _get_conn()
+    return conn.execute(
+        """SELECT request_id, created_at, client_ip, api_key_name, model, status,
+                  is_stream, error_message, input_tokens, output_tokens,
+                  cache_creation_tokens, cache_read_tokens,
+                  connect_time_ms, first_token_time_ms, total_time_ms, retry_count
+           FROM request_log
+           WHERE status IN ('success', 'error')
+           ORDER BY created_at DESC LIMIT ?""",
         (limit,),
     ).fetchall()
 
@@ -211,6 +234,8 @@ def stats_summary(since_ts):
              SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success_count,
              SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) as error_count,
              SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) as pending_count,
+             SUM(retry_count) as total_retries,
+             SUM(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END) as retried_requests,
              AVG(CASE WHEN status='success' THEN connect_time_ms END) as avg_connect_ms,
              AVG(CASE WHEN status='success' AND is_stream=1 THEN first_token_time_ms END) as avg_first_token_ms,
              AVG(CASE WHEN status='success' THEN total_time_ms END) as avg_total_ms,
@@ -229,18 +254,14 @@ def stats_summary(since_ts):
         (since_ts,),
     ).fetchall()
 
-    # 按 API Key 分组统计
-    per_key = conn.execute(
-        """SELECT api_key_name,
-             COUNT(*) as total,
-             SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success_count,
-             SUM(input_tokens) as input_tokens,
-             SUM(output_tokens) as output_tokens,
-             SUM(cache_creation_tokens) as cache_creation,
-             SUM(cache_read_tokens) as cache_read
+    recent_calls = conn.execute(
+        """SELECT request_id, created_at, model, status, error_message,
+                  is_stream,
+                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+                  connect_time_ms, first_token_time_ms, total_time_ms, retry_count
            FROM request_log WHERE created_at >= ?
-           GROUP BY api_key_name ORDER BY total DESC""",
+           ORDER BY created_at DESC LIMIT 3""",
         (since_ts,),
     ).fetchall()
 
-    return row, recent_errors, per_key
+    return row, recent_errors, recent_calls

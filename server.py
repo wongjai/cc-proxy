@@ -18,8 +18,9 @@ import httpx
 import xxhash
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask
 
 import db
 import tgbot
@@ -382,16 +383,66 @@ def _inject_cache_on_msg(msg):
     return msg
 
 
+def _msg_has_cache_control(msg):
+    """检查消息的 content block 中是否已有 cache_control"""
+    content = msg.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and "cache_control" in block:
+                return True
+    return False
+
+
+def _strip_message_cache_control(messages):
+    """移除客户端在 messages 中设置的所有 cache_control 标记。
+    客户端会在最后一条 user message 上设置 cache_control，当下一轮对话中该消息
+    不再是最后一条时，标记消失导致内容块变化，使前缀缓存失效。
+    由代理统一管理 cache_control 可确保前缀在连续请求间保持稳定。"""
+    result = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            changed = False
+            for block in content:
+                if isinstance(block, dict) and "cache_control" in block:
+                    changed = True
+                    break
+            if changed:
+                msg = dict(msg)
+                new_content = []
+                for block in content:
+                    if isinstance(block, dict) and "cache_control" in block:
+                        block = {k: v for k, v in block.items() if k != "cache_control"}
+                    new_content.append(block)
+                msg["content"] = new_content
+            result.append(msg)
+        else:
+            result.append(msg)
+    return result
+
+
 def add_cache_breakpoints(messages):
+    """注入缓存断点。断点位置：倒数第二个 user turn + 最后一条消息。
+    加上 system + tools 共 4 个断点（上限）。
+    注意：调用前应先 _strip_message_cache_control 清除客户端标记。"""
     if not messages:
         return messages
     messages = [dict(m) for m in messages]
+
+    # 1. 最后一条消息
     messages[-1] = _inject_cache_on_msg(messages[-1])
-    if len(messages) >= 3:
-        for i in range(len(messages) - 2, -1, -1):
+
+    # 2. 倒数第二个 user turn：缓存多轮对话历史
+    #    确保会话前缀在连续请求间可被复用
+    if len(messages) >= 4:
+        user_count = 0
+        for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
-                messages[i] = _inject_cache_on_msg(messages[i])
-                break
+                user_count += 1
+                if user_count == 2:
+                    messages[i] = _inject_cache_on_msg(messages[i])
+                    break
+
     return messages
 
 
@@ -430,6 +481,7 @@ def transform_request(body):
     messages = body.get("messages", [])
     user_system = body.get("system")
     messages = inject_user_system_to_messages(messages, user_system)
+    messages = _strip_message_cache_control(messages)
     messages = add_cache_breakpoints(messages)
     system_blocks = build_system_blocks(messages)
 
@@ -443,7 +495,7 @@ def transform_request(body):
         "messages": messages,
         "system": system_blocks,
         "max_tokens": body.get("max_tokens", 128000),
-        "stream": True,
+        "stream": body.get("stream", True),
         "metadata": build_metadata(),
         "temperature": 1,
     }
@@ -501,6 +553,41 @@ def build_upstream_headers(access_token):
         "x-app": "cli",
         "User-Agent": CLI_USER_AGENT,
         "x-client-request-id": str(uuid.uuid4()),
+    }
+
+
+def build_claude_error_payload(err_type, message):
+    return {
+        "type": "error",
+        "error": {
+            "type": err_type,
+            "message": message,
+        },
+    }
+
+
+def build_claude_error_response(status_code, err_type, message):
+    return JSONResponse(
+        status_code=status_code,
+        content=build_claude_error_payload(err_type, message),
+    )
+
+
+def is_retryable_transport_error(exc):
+    return isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError))
+
+
+async def retry_sleep(attempt):
+    await asyncio.sleep(0.5 * attempt)
+
+
+def extract_usage_from_response_json(response_obj):
+    usage = response_obj.get("usage", {}) if isinstance(response_obj, dict) else {}
+    return {
+        "input_tokens": usage.get("input_tokens", 0),
+        "output_tokens": usage.get("output_tokens", 0),
+        "cache_creation": usage.get("cache_creation_input_tokens", 0),
+        "cache_read": usage.get("cache_read_input_tokens", 0),
     }
 
 
@@ -590,6 +677,14 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 print(f"[DB] WAL checkpoint failed: {e}")
 
+    async def stale_pending_cleanup_loop():
+        while True:
+            await asyncio.sleep(300)
+            try:
+                await asyncio.to_thread(db.cleanup_stale_pending, 1800)
+            except Exception as e:
+                print(f"[DB] stale pending cleanup failed: {e}")
+
     # 主动 OAuth token 刷新循环（剩余 < 10 分钟时刷新）
     async def oauth_proactive_refresh_loop():
         await asyncio.sleep(30)  # 启动后等 30s 再开始
@@ -601,12 +696,14 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(60)
 
     _wal_task = asyncio.create_task(wal_checkpoint_loop())
+    _cleanup_task = asyncio.create_task(stale_pending_cleanup_loop())
     _refresh_task = asyncio.create_task(oauth_proactive_refresh_loop())
 
     yield
 
     # 关闭
     _wal_task.cancel()
+    _cleanup_task.cancel()
     _refresh_task.cancel()
     await _http_client.aclose()
 
@@ -630,14 +727,14 @@ async def proxy_messages(request: Request):
     # API Key 验证
     key_name, err = validate_api_key(request.headers)
     if err:
-        return JSONResponse(status_code=401, content={"error": err})
+        return build_claude_error_response(401, "authentication_error", err)
 
     # 读取请求体
     raw = await request.body()
     try:
         body = json.loads(raw)
     except Exception as e:
-        return JSONResponse(status_code=400, content={"error": f"invalid json: {e}"})
+        return build_claude_error_response(400, "invalid_request_error", f"invalid json: {e}")
 
     model = body.get("model", "?")
     is_stream = body.get("stream", True)
@@ -662,114 +759,332 @@ async def proxy_messages(request: Request):
         payload = transform_request(body)
     except Exception as e:
         import traceback; traceback.print_exc()
-        await asyncio.to_thread(db.finish_error, request_id, str(e), 0, int((time.time() - t_start) * 1000))
-        return JSONResponse(status_code=500, content={"error": f"transform error: {e}"})
+        await asyncio.to_thread(
+            db.finish_error,
+            request_id,
+            str(e),
+            0,
+            int((time.time() - t_start) * 1000),
+            retry_count=0,
+        )
+        return build_claude_error_response(400, "invalid_request_error", f"transform error: {e}")
 
     # 获取 token
     try:
         access_token = await get_access_token()
     except Exception as e:
         import traceback; traceback.print_exc()
-        await asyncio.to_thread(db.finish_error, request_id, f"oauth: {e}", 0, int((time.time() - t_start) * 1000))
-        return JSONResponse(status_code=502, content={"error": f"oauth error: {e}"})
+        await asyncio.to_thread(
+            db.finish_error,
+            request_id,
+            f"oauth: {e}",
+            0,
+            int((time.time() - t_start) * 1000),
+            retry_count=0,
+        )
+        return build_claude_error_response(502, "api_error", f"oauth error: {e}")
 
     headers = build_upstream_headers(access_token)
     signed_body = sign_body(payload)
+    max_attempts = 2
+    retry_count = 0
 
     # 转发（异步流式）
-    t_connect_start = time.time()
+    refreshed_after_auth_error = False
+
     try:
-        upstream_req = _http_client.build_request(
-            "POST",
-            f"{ANTHROPIC_API_BASE}/v1/messages?beta=true",
-            headers=headers,
-            content=signed_body,
-        )
-        upstream_resp = await _http_client.send(upstream_req, stream=True)
-        t_connected = time.time()
-        connect_ms = int((t_connected - t_connect_start) * 1000)
-
-        if upstream_resp.status_code >= 400:
-            err_body = (await upstream_resp.aread()).decode("utf-8", errors="replace")
-            await upstream_resp.aclose()
-            total_ms = int((time.time() - t_start) * 1000)
-            await asyncio.to_thread(db.finish_error, request_id,
-                                    f"HTTP {upstream_resp.status_code}: {err_body[:4000]}",
-                                    connect_ms, total_ms, err_body)
-            restored = _restore_tool_names_in_chunk(err_body.encode())
-            return StreamingResponse(
-                iter([restored]),
-                status_code=upstream_resp.status_code,
-                media_type=upstream_resp.headers.get("content-type", "application/json"),
-            )
-
-        # 构建流式响应
-        tracker = SSEUsageTracker()
-
-        async def stream_generator():
-            first_chunk = True
-            t_first_token = None
-            completed = False
+        for attempt in range(1, max_attempts + 1):
+            t_connect_start = time.time()
+            upstream_resp = None
+            connect_ms = None
             try:
-                async for chunk in upstream_resp.aiter_bytes():
-                    if chunk:
-                        if first_chunk:
-                            t_first_token = time.time()
-                            first_chunk = False
-                        restored = _restore_tool_names_in_chunk(chunk)
-                        tracker.feed(restored)
-                        yield restored
-                completed = True
-            except BaseException as e:
-                # 捕获 CancelledError/GeneratorExit（客户端断连）和普通异常
-                total_ms = int((time.time() - t_start) * 1000)
-                err_type = type(e).__name__
-                await asyncio.to_thread(db.finish_error, request_id,
-                                        f"stream {err_type}: {e}", connect_ms, total_ms)
-                return
-            finally:
-                await upstream_resp.aclose()
+                headers = build_upstream_headers(access_token)
+                upstream_req = _http_client.build_request(
+                    "POST",
+                    f"{ANTHROPIC_API_BASE}/v1/messages?beta=true",
+                    headers=headers,
+                    content=signed_body,
+                )
+                upstream_resp = await _http_client.send(upstream_req, stream=is_stream)
+                t_connected = time.time()
+                connect_ms = int((t_connected - t_connect_start) * 1000)
 
-            if completed:
-                # 流完成，记录成功
-                total_ms = int((time.time() - t_start) * 1000)
-                first_token_ms = int((t_first_token - t_start) * 1000) if t_first_token else None
-                await asyncio.to_thread(
-                    db.finish_success,
-                    request_id,
-                    input_tokens=tracker.usage["input_tokens"],
-                    output_tokens=tracker.usage["output_tokens"],
-                    cache_creation=tracker.usage["cache_creation"],
-                    cache_read=tracker.usage["cache_read"],
-                    connect_ms=connect_ms,
-                    first_token_ms=first_token_ms,
-                    total_ms=total_ms,
-                    response_body=tracker.get_full_response(),
+                if upstream_resp.status_code >= 400:
+                    err_body = (await upstream_resp.aread()).decode("utf-8", errors="replace")
+                    await upstream_resp.aclose()
+
+                    if upstream_resp.status_code in (401, 403) and not refreshed_after_auth_error:
+                        refreshed_after_auth_error = True
+                        oauth_data = _load_oauth_sync()
+                        access_token = await asyncio.to_thread(_refresh_token, oauth_data)
+                        retry_count += 1
+                        continue
+
+                    if 500 <= upstream_resp.status_code < 600 and attempt < max_attempts:
+                        retry_count += 1
+                        await retry_sleep(attempt)
+                        continue
+
+                    total_ms = int((time.time() - t_start) * 1000)
+                    await asyncio.to_thread(
+                        db.finish_error,
+                        request_id,
+                        f"HTTP {upstream_resp.status_code}: {err_body[:4000]}",
+                        connect_ms,
+                        total_ms,
+                        err_body,
+                        retry_count=retry_count,
+                    )
+                    restored = _restore_tool_names_in_chunk(err_body.encode())
+                    resp_headers = {}
+                    for h in ("content-type", "x-request-id", "request-id"):
+                        if h in upstream_resp.headers:
+                            resp_headers[h] = upstream_resp.headers[h]
+                    return Response(
+                        content=restored,
+                        status_code=upstream_resp.status_code,
+                        headers=resp_headers,
+                        media_type=upstream_resp.headers.get("content-type", "application/json"),
+                    )
+
+                if not is_stream:
+                    try:
+                        raw_resp = await upstream_resp.aread()
+                    except Exception as e:
+                        await upstream_resp.aclose()
+                        if is_retryable_transport_error(e) and attempt < max_attempts:
+                            retry_count += 1
+                            await retry_sleep(attempt)
+                            continue
+                        raise
+
+                    await upstream_resp.aclose()
+                    if not raw_resp:
+                        if attempt < max_attempts:
+                            await retry_sleep(attempt)
+                            continue
+                        total_ms = int((time.time() - t_start) * 1000)
+                        await asyncio.to_thread(
+                            db.finish_error,
+                            request_id,
+                            "upstream returned empty response body",
+                            connect_ms,
+                            total_ms,
+                            retry_count=retry_count,
+                        )
+                        return build_claude_error_response(
+                            502,
+                            "api_error",
+                            "Upstream returned an empty response before any content was available.",
+                        )
+
+                    restored = _restore_tool_names_in_chunk(raw_resp)
+                    total_ms = int((time.time() - t_start) * 1000)
+                    try:
+                        response_obj = json.loads(restored)
+                        usage = extract_usage_from_response_json(response_obj)
+                    except Exception:
+                        response_obj = None
+                        usage = {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_creation": 0,
+                            "cache_read": 0,
+                        }
+                    await asyncio.to_thread(
+                        db.finish_success,
+                        request_id,
+                        input_tokens=usage["input_tokens"],
+                        output_tokens=usage["output_tokens"],
+                        cache_creation=usage["cache_creation"],
+                        cache_read=usage["cache_read"],
+                        connect_ms=connect_ms,
+                        first_token_ms=None,
+                        total_ms=total_ms,
+                        response_body=restored.decode("utf-8", errors="replace"),
+                        retry_count=retry_count,
+                    )
+                    resp_headers = {}
+                    for h in ("content-type", "x-request-id", "request-id"):
+                        if h in upstream_resp.headers:
+                            resp_headers[h] = upstream_resp.headers[h]
+                    if response_obj is not None:
+                        return JSONResponse(
+                            content=response_obj,
+                            status_code=upstream_resp.status_code,
+                            headers=resp_headers,
+                        )
+                    return Response(
+                        content=restored,
+                        status_code=upstream_resp.status_code,
+                        headers=resp_headers,
+                        media_type=upstream_resp.headers.get("content-type", "application/json"),
+                    )
+
+                try:
+                    first_chunk = b""
+                    stream_iter = upstream_resp.aiter_bytes()
+                    upstream_stream_empty = False
+                    while True:
+                        chunk = await anext(stream_iter)
+                        if chunk:
+                            first_chunk = _restore_tool_names_in_chunk(chunk)
+                            break
+                except StopAsyncIteration:
+                    upstream_stream_empty = True
+                    if attempt < max_attempts:
+                        await upstream_resp.aclose()
+                        retry_count += 1
+                        await retry_sleep(attempt)
+                        continue
+                    total_ms = int((time.time() - t_start) * 1000)
+                    await asyncio.to_thread(
+                        db.finish_error,
+                        request_id,
+                        "upstream closed stream before first chunk",
+                        connect_ms,
+                        total_ms,
+                        retry_count=retry_count,
+                    )
+                    return build_claude_error_response(
+                        502,
+                        "api_error",
+                        "Upstream stream closed before first token was returned.",
+                    )
+                except Exception as e:
+                    await upstream_resp.aclose()
+                    if is_retryable_transport_error(e) and attempt < max_attempts:
+                        retry_count += 1
+                        await retry_sleep(attempt)
+                        continue
+                    raise
+
+                tracker = SSEUsageTracker()
+                finalized = False
+                finalize_lock = asyncio.Lock()
+                first_token_ts = time.time() if first_chunk else None
+                if first_chunk:
+                    tracker.feed(first_chunk)
+
+                async def finalize_success():
+                    nonlocal finalized
+                    async with finalize_lock:
+                        if finalized:
+                            return
+                        finalized = True
+                        total_ms = int((time.time() - t_start) * 1000)
+                        first_token_ms = int((first_token_ts - t_start) * 1000) if first_token_ts else None
+                        await asyncio.to_thread(
+                            db.finish_success,
+                            request_id,
+                            input_tokens=tracker.usage["input_tokens"],
+                            output_tokens=tracker.usage["output_tokens"],
+                            cache_creation=tracker.usage["cache_creation"],
+                            cache_read=tracker.usage["cache_read"],
+                            connect_ms=connect_ms,
+                            first_token_ms=first_token_ms,
+                            total_ms=total_ms,
+                            response_body=tracker.get_full_response(),
+                            retry_count=retry_count,
+                        )
+
+                async def finalize_error(message, response_body=None):
+                    nonlocal finalized
+                    async with finalize_lock:
+                        if finalized:
+                            return
+                        finalized = True
+                        total_ms = int((time.time() - t_start) * 1000)
+                        await asyncio.to_thread(
+                            db.finish_error,
+                            request_id,
+                            message,
+                            connect_ms,
+                            total_ms,
+                            response_body,
+                            retry_count=retry_count,
+                        )
+
+                async def stream_generator():
+                    completed = False
+                    try:
+                        if first_chunk:
+                            yield first_chunk
+                        if not upstream_stream_empty:
+                            async for chunk in stream_iter:
+                                if chunk:
+                                    restored = _restore_tool_names_in_chunk(chunk)
+                                    tracker.feed(restored)
+                                    yield restored
+                        completed = True
+                    except BaseException as e:
+                        err_type = type(e).__name__
+                        await finalize_error(f"stream {err_type}: {e}", tracker.get_full_response())
+                        return
+                    finally:
+                        await upstream_resp.aclose()
+
+                    if completed:
+                        await finalize_success()
+
+                async def on_response_close():
+                    await upstream_resp.aclose()
+                    await finalize_error("response closed before stream completed", tracker.get_full_response())
+
+                resp_headers = {}
+                for h in ("content-type", "x-request-id", "request-id"):
+                    if h in upstream_resp.headers:
+                        resp_headers[h] = upstream_resp.headers[h]
+
+                return StreamingResponse(
+                    stream_generator(),
+                    status_code=upstream_resp.status_code,
+                    headers=resp_headers,
+                    background=BackgroundTask(on_response_close),
                 )
 
-        resp_headers = {}
-        for h in ("content-type", "x-request-id", "request-id"):
-            if h in upstream_resp.headers:
-                resp_headers[h] = upstream_resp.headers[h]
+            except Exception as e:
+                if upstream_resp is not None:
+                    try:
+                        await upstream_resp.aclose()
+                    except Exception:
+                        pass
+                if is_retryable_transport_error(e) and attempt < max_attempts:
+                    retry_count += 1
+                    await retry_sleep(attempt)
+                    continue
+                raise
 
-        return StreamingResponse(
-            stream_generator(),
-            status_code=upstream_resp.status_code,
-            headers=resp_headers,
-        )
-
-    except httpx.TimeoutException:
+    except httpx.TimeoutException as e:
         total_ms = int((time.time() - t_start) * 1000)
-        await asyncio.to_thread(db.finish_error, request_id, "upstream timeout", None, total_ms)
-        return JSONResponse(status_code=504, content={"error": "upstream timeout"})
+        msg = f"upstream timeout: {e}"
+        await asyncio.to_thread(db.finish_error, request_id, msg, None, total_ms, retry_count=retry_count)
+        return build_claude_error_response(504, "api_error", "Upstream request timed out before any response was returned.")
     except httpx.ConnectError as e:
         total_ms = int((time.time() - t_start) * 1000)
-        await asyncio.to_thread(db.finish_error, request_id, f"connection error: {e}", None, total_ms)
-        return JSONResponse(status_code=502, content={"error": f"upstream connection error: {e}"})
+        msg = f"connection error: {e}"
+        await asyncio.to_thread(db.finish_error, request_id, msg, None, total_ms, retry_count=retry_count)
+        return build_claude_error_response(502, "api_error", "Upstream connection failed before any response was returned.")
+    except (httpx.ReadError, httpx.RemoteProtocolError) as e:
+        total_ms = int((time.time() - t_start) * 1000)
+        msg = f"transport error: {e}"
+        await asyncio.to_thread(db.finish_error, request_id, msg, None, total_ms, retry_count=retry_count)
+        return build_claude_error_response(502, "api_error", "Upstream transport failed before any response was returned.")
     except Exception as e:
         total_ms = int((time.time() - t_start) * 1000)
-        await asyncio.to_thread(db.finish_error, request_id, str(e), None, total_ms)
-        return JSONResponse(status_code=502, content={"error": str(e)})
+        await asyncio.to_thread(db.finish_error, request_id, str(e), None, total_ms, retry_count=retry_count)
+        return build_claude_error_response(502, "api_error", str(e))
+    except BaseException as e:
+        total_ms = int((time.time() - t_start) * 1000)
+        await asyncio.to_thread(
+            db.finish_error,
+            request_id,
+            f"request {type(e).__name__}: {e}",
+            None,
+            total_ms,
+            retry_count=retry_count,
+        )
+        raise
 
 
 # ─── 启动 ───

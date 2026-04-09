@@ -56,7 +56,11 @@ def start():
     if not _bot_token:
         return
     global _tg_session
-    _tg_session = httpx.Client(timeout=30, http2=False)
+    _tg_session = httpx.Client(
+        timeout=httpx.Timeout(connect=10.0, read=50.0, write=10.0, pool=10.0),
+        limits=httpx.Limits(max_connections=5, max_keepalive_connections=2, keepalive_expiry=30),
+        http2=False,
+    )
     # 注册 Bot 命令菜单
     _api("setMyCommands", {
         "commands": [
@@ -226,8 +230,7 @@ def _handle_oauth_menu(chat_id, msg_id, cb_id):
         # 获取使用量（token 过期会自动刷新）
         usage_text = ""
         try:
-            from server import get_access_token_sync
-            access_token = get_access_token_sync()
+            access_token = _get_access_token()
             usage_data = _fetch_oauth_usage(access_token)
             usage_text = _format_usage(usage_data)
         except Exception as e:
@@ -514,11 +517,11 @@ def _handle_stats_menu(chat_id, msg_id, cb_id):
 def _handle_stats(chat_id, msg_id, cb_id, period):
     _answer_cb(cb_id)
     now = time.time()
-    if period == "all":
-        since = 0
-        label = "所有时间"
+    if period == "month":
+        month_start = datetime.now(_BJT).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        since = month_start.timestamp()
+        label = "本月"
     elif period == "0":
-        # 今天 00:00 UTC
         today = datetime.now(_BJT).replace(hour=0, minute=0, second=0, microsecond=0)
         since = today.timestamp()
         label = "今天"
@@ -526,46 +529,69 @@ def _handle_stats(chat_id, msg_id, cb_id, period):
         since = now - int(period) * 86400
         label = f"最近 {period} 天"
 
-    row, errors, per_key = db.stats_summary(since)
+    row, _errors, recent_calls = db.stats_summary(since)
     total = row["total"] or 0
     text = f"<b>📊 统计 — {label}</b>\n\n"
-    text += f"请求总数: {total}\n"
-    text += f"  ✅ 成功: {row['success_count'] or 0}\n"
-    text += f"  ❌ 失败: {row['error_count'] or 0}\n"
-    text += f"  ⏳ 进行中: {row['pending_count'] or 0}\n\n"
-    if row["avg_connect_ms"] is not None:
-        text += f"平均连接耗时: {row['avg_connect_ms']:.0f}ms\n"
-    if row["avg_first_token_ms"] is not None:
-        text += f"平均首字耗时: {row['avg_first_token_ms']:.0f}ms\n"
-    if row["avg_total_ms"] is not None:
-        text += f"平均总耗时: {row['avg_total_ms']:.0f}ms\n"
-    text += f"\nTokens:\n"
-    text += f"  输入: {row['total_input_tokens'] or 0}\n"
-    text += f"  输出: {row['total_output_tokens'] or 0}\n"
-    text += f"  缓存写入: {row['total_cache_creation'] or 0}\n"
-    text += f"  缓存读取: {row['total_cache_read'] or 0}\n"
+    raw_inp = (row['total_input_tokens'] or 0)
+    raw_out = (row['total_output_tokens'] or 0)
+    raw_cr = (row['total_cache_read'] or 0)
+    total_retries = row['total_retries'] or 0
+    retried_requests = row['retried_requests'] or 0
+    total_inp = raw_inp + (row['total_cache_creation'] or 0) + raw_cr
+    cache_hit_rate = (raw_cr / total_inp * 100) if total_inp > 0 else 0
+    success_count = row['success_count'] or 0
+    error_count = row['error_count'] or 0
+    pending_count = row['pending_count'] or 0
+    success_rate = (success_count / total * 100) if total > 0 else 0
 
-    if per_key and len(per_key) > 0:
-        text += f"\n<b>按 Key 统计:</b>\n"
-        for k in per_key:
-            name = k['api_key_name'] or '?'
-            text += f"  <code>{name}</code>: {k['total']}次 ✅{k['success_count'] or 0} 入{k['input_tokens'] or 0} 出{k['output_tokens'] or 0}\n"
+    text += "Tokens:\n"
+    text += f"↑ {_fmt_tokens(total_inp)} | ↓ {_fmt_tokens(raw_out)} | cache {_fmt_tokens(raw_cr)} ({cache_hit_rate:.1f}%)\n\n"
+    text += "请求:\n"
+    text += f"共 {total} 次 | ✅ {success_count} | ❌ {error_count} | ⏳ {pending_count}\n"
+    text += f"成功率 {success_rate:.1f}%\n\n"
+    text += "耗时（平均）:\n"
+    conn_avg = f"{row['avg_connect_ms']:.0f}ms" if row["avg_connect_ms"] is not None else "-"
+    first_avg = f"{row['avg_first_token_ms']:.0f}ms" if row["avg_first_token_ms"] is not None else "-"
+    total_avg = f"{row['avg_total_ms']:.0f}ms" if row["avg_total_ms"] is not None else "-"
+    text += f"连接 {conn_avg} | 首字 {first_avg} | 总 {total_avg}\n"
+    if total > 0:
+        text += "\n重试:\n"
+        text += f"共 {total_retries} 次 | 命中 {retried_requests} 个请求 ({retried_requests / total * 100:.1f}%)\n"
 
-    if errors:
-        text += f"\n<b>最近失败 ({len(errors)} 条):</b>\n"
-        for e in errors:
-            ts = datetime.fromtimestamp(e["created_at"], tz=_BJT).strftime("%m-%d %H:%M")
-            text += f"\n<code>[{ts}]</code> {e['api_key_name'] or '?'} / {e['model'] or '?'}\n"
-            err = (e["error_message"] or "")[:300]
-            text += f"<pre>{_escape_html(err)}</pre>\n"
+    if recent_calls:
+        text += "\n<b>最近调用:</b>\n"
+        for r in recent_calls:
+            ts = datetime.fromtimestamp(r["created_at"], tz=_BJT).strftime("%m-%d %H:%M:%S")
+            status_icon = {"success": "✅", "error": "❌", "pending": "⏳"}.get(r["status"], "?")
+            text += f"\n<code>[{ts}]</code> {status_icon} {r['model'] or '?'}\n"
+            details = []
+            if r["status"] == "success":
+                inp = (r["input_tokens"] or 0) + (r["cache_creation_tokens"] or 0) + (r["cache_read_tokens"] or 0)
+                details.append(f"Tokens: ↑{_fmt_tokens(inp)} | ↓{_fmt_tokens(r['output_tokens'] or 0)} | cache {_fmt_tokens(r['cache_read_tokens'] or 0)}")
+            timing = []
+            if r["connect_time_ms"] is not None:
+                timing.append(f"连接 {r['connect_time_ms'] / 1000:.1f}s")
+            if r["is_stream"] and r["first_token_time_ms"] is not None:
+                timing.append(f"首字 {r['first_token_time_ms'] / 1000:.1f}s")
+            if r["total_time_ms"] is not None:
+                timing.append(f"总 {r['total_time_ms'] / 1000:.1f}s")
+            if (r["retry_count"] or 0) > 0:
+                timing.append(f"重试 {r['retry_count']} 次")
+            if timing:
+                details.append("耗时: " + " | ".join(timing))
+            if r["status"] == "error" and r["error_message"]:
+                details.append("错误: " + _escape_html(_extract_error_summary(r["error_message"])[:120]))
+            for line in details:
+                text += f"  {line}\n"
 
     period_buttons = [
         {"text": "今天", "callback_data": "stats:0"},
         {"text": "3天", "callback_data": "stats:3"},
         {"text": "7天", "callback_data": "stats:7"},
-        {"text": "30天", "callback_data": "stats:30"},
-        {"text": "所有", "callback_data": "stats:all"},
+        {"text": "本月", "callback_data": "stats:month"},
     ]
+    if len(text) > 3900:
+        text = text[:3900] + "\n\n... (已截断)"
     _edit(chat_id, msg_id, text, _inline_kb([
         period_buttons,
         [{"text": "🔄 刷新", "callback_data": f"stats:{period}"}],
@@ -577,29 +603,48 @@ def _handle_stats(chat_id, msg_id, cb_id, period):
 
 def _handle_logs(chat_id, msg_id, cb_id):
     _answer_cb(cb_id)
-    rows = db.recent_logs(20)
+    rows = db.recent_logs(10)
     if not rows:
         _edit(chat_id, msg_id, "暂无日志。", _inline_kb([[{"text": "◀ 返回", "callback_data": "back_menu"}]]))
         return
 
-    text = "<b>📋 最近 20 条日志</b>\n"
+    lines = ["<b>📋 最近 10 条日志</b>"]
     for r in rows:
-        ts = datetime.fromtimestamp(r["created_at"], tz=_BJT).strftime("%m-%d %H:%M:%S")
+        ts = datetime.fromtimestamp(r["created_at"], tz=_BJT).strftime("%m-%d %H:%M")
         status_icon = {"success": "✅", "error": "❌", "pending": "⏳"}.get(r["status"], "?")
-        line = f"\n<code>{ts}</code> {status_icon} <b>{r['api_key_name'] or '?'}</b> {r['model'] or '?'}"
+        line = "\n<code>%s</code> %s %s" % (ts, status_icon, r["model"] or "?")
+        detail_parts = []
+        if r["status"] == "success":
+            inp = (r["input_tokens"] or 0) + (r["cache_creation_tokens"] or 0) + (r["cache_read_tokens"] or 0)
+            cr = r["cache_read_tokens"] or 0
+            tok_str = "↑%s ↓%s" % (_fmt_tokens(inp), _fmt_tokens(r["output_tokens"] or 0))
+            if cr > 0:
+                tok_str += " 缓存%s" % _fmt_tokens(cr)
+            detail_parts.append(tok_str)
         if r["connect_time_ms"] is not None:
-            line += f"\n  连接:{r['connect_time_ms']}ms"
+            detail_parts.append("连接%.1fs" % (r["connect_time_ms"] / 1000))
         if r["is_stream"] and r["first_token_time_ms"] is not None:
-            line += f" 首字:{r['first_token_time_ms']}ms"
+            detail_parts.append("首字%.1fs" % (r["first_token_time_ms"] / 1000))
         if r["total_time_ms"] is not None:
-            line += f" 总:{r['total_time_ms']}ms"
+            detail_parts.append("总%.1fs" % (r["total_time_ms"] / 1000))
+        if (r["retry_count"] or 0) > 0:
+            detail_parts.append("重试%d次" % (r["retry_count"] or 0))
+        if detail_parts:
+            line += "\n  %s" % " | ".join(detail_parts)
         if r["status"] == "error" and r["error_message"]:
-            err = r["error_message"][:200]
-            line += f"\n  <pre>{_escape_html(err)}</pre>"
-        text += line
-    # Telegram 消息限制 4096 字符
-    if len(text) > 4000:
-        text = text[:4000] + "\n... (截断)"
+            summary = _extract_error_summary(r["error_message"])
+            line += "\n  %s" % _escape_html(summary)
+        lines.append(line)
+
+    # 安全拼接，不超过 Telegram 限制，避免截断 HTML 标签
+    text = ""
+    for line in lines:
+        candidate = text + line
+        if len(candidate) > 3900:
+            break
+        text = candidate
+    if text != "".join(lines):
+        text += "\n\n... (已截断)"
 
     _edit(chat_id, msg_id, text, _inline_kb([
         [{"text": "🔄 刷新", "callback_data": "menu_logs"}],
@@ -622,6 +667,45 @@ def _escape_html(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _fmt_tokens(n):
+    """格式化 token 数量为可读形式"""
+    n = n or 0
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def _extract_error_summary(raw):
+    """从错误消息中提取可读摘要"""
+    if not raw:
+        return "未知错误"
+    # 格式: "HTTP 500: {json}" 或 "stream ...: ..." 或纯文本
+    prefix = ""
+    json_part = raw
+    if raw.startswith("HTTP "):
+        # 提取 HTTP 状态码
+        colon_idx = raw.find(": ")
+        if colon_idx > 0:
+            prefix = raw[:colon_idx]
+            json_part = raw[colon_idx + 2:]
+        else:
+            return raw[:200]
+    try:
+        obj = json.loads(json_part)
+        err = obj.get("error", {})
+        if isinstance(err, dict):
+            err_type = err.get("type", "")
+            err_msg = err.get("message", "")
+            if err_msg:
+                summary = f"{err_type}: {err_msg}" if err_type else err_msg
+                return f"{prefix} — {summary}" if prefix else summary
+        return f"{prefix} — {json_part[:150]}" if prefix else json_part[:200]
+    except (json.JSONDecodeError, TypeError):
+        return raw[:200]
+
+
 def _is_admin(chat_id):
     return not _admin_ids or chat_id in _admin_ids
 
@@ -637,6 +721,22 @@ def _cleanup_stale_states():
         _user_states.pop(cid, None)
 
 
+def _rebuild_tg_session():
+    """重建 httpx 持久连接，用于连续失败后恢复"""
+    global _tg_session
+    try:
+        if _tg_session:
+            _tg_session.close()
+    except Exception:
+        pass
+    _tg_session = httpx.Client(
+        timeout=httpx.Timeout(connect=10.0, read=50.0, write=10.0, pool=10.0),
+        limits=httpx.Limits(max_connections=5, max_keepalive_connections=2, keepalive_expiry=30),
+        http2=False,
+    )
+    print("[TG Bot] Session rebuilt")
+
+
 def _poll_loop():
     global _offset
     fail_count = 0
@@ -646,6 +746,9 @@ def _poll_loop():
             result = _api("getUpdates", {"offset": _offset, "timeout": 30})
             if not result or not result.get("ok"):
                 fail_count += 1
+                if fail_count >= 10 and fail_count % 10 == 0:
+                    print(f"[TG Bot] {fail_count} consecutive failures, rebuilding session")
+                    _rebuild_tg_session()
                 time.sleep(min(5 * fail_count, 60))
                 continue
             fail_count = 0
@@ -662,6 +765,9 @@ def _poll_loop():
                 _cleanup_stale_states()
         except Exception:
             fail_count += 1
+            if fail_count >= 10 and fail_count % 10 == 0:
+                print(f"[TG Bot] {fail_count} consecutive failures (exception), rebuilding session")
+                _rebuild_tg_session()
             time.sleep(min(5 * fail_count, 60))
 
 
@@ -763,8 +869,7 @@ def _handle_update(update):
             [{"text": "今天", "callback_data": "stats:0"},
              {"text": "3天", "callback_data": "stats:3"},
              {"text": "7天", "callback_data": "stats:7"}],
-            [{"text": "30天", "callback_data": "stats:30"},
-             {"text": "所有", "callback_data": "stats:all"}],
+            [{"text": "本月", "callback_data": "stats:month"}],
             [{"text": "◀ 返回主菜单", "callback_data": "back_menu"}],
         ]))
     elif text.startswith("/logs"):
@@ -783,6 +888,8 @@ def _handle_update(update):
                 line += f" 首字:{r['first_token_time_ms']}ms"
             if r["total_time_ms"] is not None:
                 line += f" 总:{r['total_time_ms']}ms"
+            if (r["retry_count"] or 0) > 0:
+                line += f" 重试:{r['retry_count']}次"
             if r["status"] == "error" and r["error_message"]:
                 line += f"\n  <pre>{_escape_html(r['error_message'][:200])}</pre>"
             txt += line
