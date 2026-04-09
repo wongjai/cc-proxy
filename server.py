@@ -1,6 +1,6 @@
 """
-CC Proxy v3.0 — Claude Code 模拟中转服务
-基于 FastAPI + uvicorn + httpx，异步并发，连接池复用。
+CC Proxy v3.0 — Claude Code 模擬中轉服務
+基於 FastAPI + uvicorn + httpx，異步併發，連接池複用。
 """
 
 import json
@@ -25,7 +25,7 @@ from starlette.background import BackgroundTask
 import db
 import tgbot
 
-# ─── 配置加载（带缓存）───
+# ─── 配置加載（帶緩存）───
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
@@ -92,7 +92,7 @@ def _load_or_create_device_id():
 DEVICE_ID = _load_or_create_device_id()
 
 
-# ─── API Key 验证（常数时间比较）───
+# ─── API Key 驗證（常數時間比較）───
 
 def validate_api_key(headers):
     auth = headers.get("authorization") or ""
@@ -115,7 +115,7 @@ def validate_api_key(headers):
     return None, "Invalid API key"
 
 
-# ─── OAuth token 管理（带缓存）───
+# ─── OAuth token 管理（帶緩存）───
 
 _oauth_lock = asyncio.Lock()
 _oauth_cache = None
@@ -164,7 +164,7 @@ def _save_oauth(data):
 
 
 def _refresh_token(oauth_data):
-    """刷新 OAuth token — 使用 _sync_token_lock 序列化所有调用者（async + tgbot）"""
+    """刷新 OAuth token — 使用 _sync_token_lock 序列化所有調用者（async + tgbot）"""
     with _sync_token_lock:
         print("[OAuth] Refreshing token...")
         resp = httpx.post(
@@ -192,8 +192,8 @@ def _refresh_token(oauth_data):
 
 
 async def _proactive_token_refresh():
-    """主动检查 token 是否即将过期（< 10 分钟），提前刷新并通知 TG。
-    刷新最多重试 3 次，用量获取最多重试 2 次。"""
+    """主動檢查 token 是否即將過期（< 10 分鐘），提前刷新並通知 TG。
+    刷新最多重試 3 次，用量獲取最多重試 2 次。"""
     try:
         oauth_data = _load_oauth_sync()
     except Exception as e:
@@ -208,14 +208,14 @@ async def _proactive_token_refresh():
         expired_dt = datetime.fromisoformat(expired_str.replace("Z", "+00:00"))
         remaining = (expired_dt - datetime.now(timezone.utc)).total_seconds()
     except Exception:
-        remaining = -1  # 解析失败视为已过期，直接刷
+        remaining = -1  # 解析失敗視爲已過期，直接刷
 
     if remaining >= 600:
-        return  # 还有 10 分钟以上，不动
+        return  # 還有 10 分鐘以上，不動
 
     print(f"[OAuth] Proactive: {remaining:.0f}s remaining, refreshing...")
 
-    # 刷新 token，最多重试 3 次
+    # 刷新 token，最多重試 3 次
     access_token = None
     last_err = None
     for attempt in range(1, 4):
@@ -230,19 +230,19 @@ async def _proactive_token_refresh():
                 await asyncio.sleep(10 * attempt)  # 10s, 20s
 
     if access_token is None:
-        msg = f"⚠️ OAuth 主动刷新失败（已重试 3 次）\n错误: {last_err}"
+        msg = f"⚠️ OAuth 主動刷新失敗（已重試 3 次）\n錯誤: {last_err}"
         print(f"[OAuth] Proactive: all retries failed")
         tgbot.notify_admins(msg)
         return
 
-    # 重新读取刷新后的 oauth（_refresh_token 已写入文件）
+    # 重新讀取刷新後的 oauth（_refresh_token 已寫入文件）
     try:
         oauth_data = _load_oauth_sync()
         new_expired = oauth_data.get("expired", "?")
     except Exception:
         new_expired = "?"
 
-    # 获取用量，最多重试 2 次
+    # 獲取用量，最多重試 2 次
     usage_text = ""
     for attempt in range(1, 3):
         try:
@@ -254,9 +254,9 @@ async def _proactive_token_refresh():
             if attempt < 2:
                 await asyncio.sleep(5)
             else:
-                usage_text = f"⚠️ 用量获取失败: {e}"
+                usage_text = f"⚠️ 用量獲取失敗: {e}"
 
-    # 北京时间格式化
+    # 北京時間格式化
     def _to_bjt(s):
         try:
             dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
@@ -266,9 +266,9 @@ async def _proactive_token_refresh():
             return s
 
     msg = (
-        f"✅ OAuth Token 已主动刷新\n"
-        f"新过期时间: <code>{_to_bjt(new_expired)}</code>\n\n"
-        f"<b>📊 当前用量</b>\n{usage_text}"
+        f"✅ OAuth Token 已主動刷新\n"
+        f"新過期時間: <code>{_to_bjt(new_expired)}</code>\n\n"
+        f"<b>📊 當前用量</b>\n{usage_text}"
     )
     tgbot.notify_admins(msg)
 
@@ -284,13 +284,13 @@ async def get_access_token():
                     try:
                         return await asyncio.to_thread(_refresh_token, oauth_data)
                     except Exception as e:
-                        tgbot.notify_admins(f"⚠️ OAuth 自动刷新失败: {e}")
+                        tgbot.notify_admins(f"⚠️ OAuth 自動刷新失敗: {e}")
                         raise
             except Exception:
                 try:
                     return await asyncio.to_thread(_refresh_token, oauth_data)
                 except Exception as e:
-                    tgbot.notify_admins(f"⚠️ OAuth 自动刷新失败: {e}")
+                    tgbot.notify_admins(f"⚠️ OAuth 自動刷新失敗: {e}")
                     raise
         return oauth_data["access_token"]
 
@@ -303,7 +303,7 @@ def get_access_token_sync():
         try:
             expired_dt = datetime.fromisoformat(expired_str.replace("Z", "+00:00"))
             if (expired_dt - datetime.now(timezone.utc)).total_seconds() < 300:
-                return _refresh_token(oauth_data)  # _refresh_token 内部持有 _sync_token_lock
+                return _refresh_token(oauth_data)  # _refresh_token 內部持有 _sync_token_lock
         except Exception:
             return _refresh_token(oauth_data)
     return oauth_data["access_token"]
@@ -367,7 +367,7 @@ def inject_user_system_to_messages(messages, user_system):
     return messages
 
 
-# ─── 缓存断点 ───
+# ─── 緩存斷點 ───
 
 def _inject_cache_on_msg(msg):
     msg = dict(msg)
@@ -384,7 +384,7 @@ def _inject_cache_on_msg(msg):
 
 
 def _msg_has_cache_control(msg):
-    """检查消息的 content block 中是否已有 cache_control"""
+    """檢查消息的 content block 中是否已有 cache_control"""
     content = msg.get("content")
     if isinstance(content, list):
         for block in content:
@@ -394,10 +394,10 @@ def _msg_has_cache_control(msg):
 
 
 def _strip_message_cache_control(messages):
-    """移除客户端在 messages 中设置的所有 cache_control 标记。
-    客户端会在最后一条 user message 上设置 cache_control，当下一轮对话中该消息
-    不再是最后一条时，标记消失导致内容块变化，使前缀缓存失效。
-    由代理统一管理 cache_control 可确保前缀在连续请求间保持稳定。"""
+    """移除客戶端在 messages 中設置的所有 cache_control 標記。
+    客戶端會在最後一條 user message 上設置 cache_control，當下一輪對話中該消息
+    不再是最後一條時，標記消失導致內容塊變化，使前綴緩存失效。
+    由代理統一管理 cache_control 可確保前綴在連續請求間保持穩定。"""
     result = []
     for msg in messages:
         content = msg.get("content")
@@ -422,18 +422,18 @@ def _strip_message_cache_control(messages):
 
 
 def add_cache_breakpoints(messages):
-    """注入缓存断点。断点位置：倒数第二个 user turn + 最后一条消息。
-    加上 system + tools 共 4 个断点（上限）。
-    注意：调用前应先 _strip_message_cache_control 清除客户端标记。"""
+    """注入緩存斷點。斷點位置：倒數第二個 user turn + 最後一條消息。
+    加上 system + tools 共 4 個斷點（上限）。
+    注意：調用前應先 _strip_message_cache_control 清除客戶端標記。"""
     if not messages:
         return messages
     messages = [dict(m) for m in messages]
 
-    # 1. 最后一条消息
+    # 1. 最後一條消息
     messages[-1] = _inject_cache_on_msg(messages[-1])
 
-    # 2. 倒数第二个 user turn：缓存多轮对话历史
-    #    确保会话前缀在连续请求间可被复用
+    # 2. 倒數第二個 user turn：緩存多輪對話歷史
+    #    確保會話前綴在連續請求間可被複用
     if len(messages) >= 4:
         user_count = 0
         for i in range(len(messages) - 1, -1, -1):
@@ -446,7 +446,7 @@ def add_cache_breakpoints(messages):
     return messages
 
 
-# ─── Metadata（使用缓存的 oauth）───
+# ─── Metadata（使用緩存的 oauth）───
 
 def build_metadata():
     try:
@@ -457,7 +457,7 @@ def build_metadata():
     return {"user_id": json.dumps({"device_id": DEVICE_ID, "account_uuid": account_uuid}, separators=(",", ":"))}
 
 
-# ─── 工具名重写 ───
+# ─── 工具名重寫 ───
 
 TOOL_NAME_REWRITES = {"sessions_": "cc_sess_", "session_": "cc_ses_"}
 
@@ -475,7 +475,7 @@ def _restore_tool_names_in_chunk(chunk_bytes):
     return chunk_bytes
 
 
-# ─── 请求转换 ───
+# ─── 請求轉換 ───
 
 def transform_request(body):
     messages = body.get("messages", [])
@@ -531,7 +531,7 @@ def transform_request(body):
     return payload
 
 
-# ─── CCH 签名 ───
+# ─── CCH 簽名 ───
 
 CCH_SEED = 0x6E52736AC806831E
 CCH_PLACEHOLDER = b"cch=00000"
@@ -594,8 +594,8 @@ def extract_usage_from_response_json(response_obj):
 # ─── SSE 流式 usage 解析器（流式提取，不存全量）───
 
 class SSEUsageTracker:
-    """从 SSE 流中实时提取 usage，同时收集完整响应用于 DB 存储。
-    使用行缓冲处理跨 chunk 的 JSON 事件。"""
+    """從 SSE 流中實時提取 usage，同時收集完整響應用於 DB 存儲。
+    使用行緩衝處理跨 chunk 的 JSON 事件。"""
 
     def __init__(self):
         self.usage = {"input_tokens": 0, "output_tokens": 0, "cache_creation": 0, "cache_read": 0}
@@ -605,7 +605,7 @@ class SSEUsageTracker:
     def feed(self, chunk_bytes):
         self._chunks.append(chunk_bytes)
         self._buf += chunk_bytes
-        # 按行处理，保留不完整的尾行到下次
+        # 按行處理，保留不完整的尾行到下次
         while b"\n" in self._buf:
             line_bytes, self._buf = self._buf.split(b"\n", 1)
             line = line_bytes.decode("utf-8", errors="replace")
@@ -629,11 +629,11 @@ class SSEUsageTracker:
                 self.usage["output_tokens"] = u.get("output_tokens", 0)
 
     def get_full_response(self):
-        """返回完整响应文本，不截断"""
+        """返回完整響應文本，不截斷"""
         return b"".join(self._chunks).decode("utf-8", errors="replace")
 
 
-# ─── FastAPI 应用 ───
+# ─── FastAPI 應用 ───
 
 _http_client = None
 
@@ -641,7 +641,7 @@ _http_client = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _http_client
-    # 启动
+    # 啓動
     db.init(DB_PATH)
     db.cleanup_stale_pending(timeout_seconds=600)
 
@@ -668,7 +668,7 @@ async def lifespan(app: FastAPI):
     print(f"Listening on http://{LISTEN_HOST}:{LISTEN_PORT}/v1/messages")
     print()
 
-    # 启动定期 WAL checkpoint
+    # 啓動定期 WAL checkpoint
     async def wal_checkpoint_loop():
         while True:
             await asyncio.sleep(300)
@@ -685,9 +685,9 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 print(f"[DB] stale pending cleanup failed: {e}")
 
-    # 主动 OAuth token 刷新循环（剩余 < 10 分钟时刷新）
+    # 主動 OAuth token 刷新循環（剩餘 < 10 分鐘時刷新）
     async def oauth_proactive_refresh_loop():
-        await asyncio.sleep(30)  # 启动后等 30s 再开始
+        await asyncio.sleep(30)  # 啓動後等 30s 再開始
         while True:
             try:
                 await _proactive_token_refresh()
@@ -701,7 +701,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # 关闭
+    # 關閉
     _wal_task.cancel()
     _cleanup_task.cancel()
     _refresh_task.cancel()
@@ -724,12 +724,12 @@ async def proxy_messages(request: Request):
     request_id = str(uuid.uuid4())
     client_ip = request.client.host if request.client else "?"
 
-    # API Key 验证
+    # API Key 驗證
     key_name, err = validate_api_key(request.headers)
     if err:
         return build_claude_error_response(401, "authentication_error", err)
 
-    # 读取请求体
+    # 讀取請求體
     raw = await request.body()
     try:
         body = json.loads(raw)
@@ -741,20 +741,20 @@ async def proxy_messages(request: Request):
     msg_count = len(body.get("messages", []))
     tool_count = len(body.get("tools", []))
 
-    # 记录请求头（脱敏）
+    # 記錄請求頭（脫敏）
     req_headers = dict(request.headers)
     for h in ("authorization", "x-api-key"):
         if h in req_headers:
             req_headers[h] = "***"
 
-    # 写入 pending 日志
+    # 寫入 pending 日誌
     await asyncio.to_thread(db.insert_pending, request_id, client_ip, key_name, model, is_stream,
                             msg_count, tool_count, req_headers, body)
 
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[{ts}] {client_ip} {key_name} -> {model} | msgs={msg_count} tools={tool_count}")
 
-    # 转换请求
+    # 轉換請求
     try:
         payload = transform_request(body)
     except Exception as e:
@@ -769,7 +769,7 @@ async def proxy_messages(request: Request):
         )
         return build_claude_error_response(400, "invalid_request_error", f"transform error: {e}")
 
-    # 获取 token
+    # 獲取 token
     try:
         access_token = await get_access_token()
     except Exception as e:
@@ -789,7 +789,7 @@ async def proxy_messages(request: Request):
     max_attempts = 2
     retry_count = 0
 
-    # 转发（异步流式）
+    # 轉發（異步流式）
     refreshed_after_auth_error = False
 
     try:
@@ -1087,7 +1087,7 @@ async def proxy_messages(request: Request):
         raise
 
 
-# ─── 启动 ───
+# ─── 啓動 ───
 
 def main():
     uvicorn.run(
