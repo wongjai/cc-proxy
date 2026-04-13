@@ -703,7 +703,7 @@ def transform_request(body):
             tc["name"] = _sanitize_tool_name(tc["name"])
         payload["tool_choice"] = tc
 
-    if supports_adaptive or supports_thinking:
+    if payload_uses_thinking(payload):
         payload["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}
     if supports_adaptive:
         payload["output_config"] = {"effort": "high"}
