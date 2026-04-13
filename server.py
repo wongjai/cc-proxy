@@ -398,6 +398,39 @@ def inject_user_system_to_messages(messages, user_system):
     return messages
 
 
+def _normalize_message_content(msg):
+    msg = dict(msg)
+    role = msg.get("role")
+    content = msg.get("content")
+
+    if isinstance(content, str):
+        if content.strip():
+            return msg
+        if role == "user":
+            msg["content"] = [{"type": "text", "text": "..."}]
+        return msg
+
+    if isinstance(content, list):
+        new_content = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text" and not str(block.get("text", "")).strip():
+                continue
+            new_content.append(block)
+        if new_content:
+            msg["content"] = new_content
+        elif role == "user":
+            msg["content"] = [{"type": "text", "text": "..."}]
+        return msg
+
+    if role == "user":
+        msg["content"] = [{"type": "text", "text": "..."}]
+    return msg
+
+
+def normalize_messages(messages):
+    return [_normalize_message_content(msg) if isinstance(msg, dict) else msg for msg in messages]
+
+
 # ─── 緩存斷點 ───
 
 def _inject_cache_on_msg(msg, default_ttl=""):
@@ -660,6 +693,7 @@ def transform_request(body):
     messages = body.get("messages", [])
     user_system = body.get("system")
     messages = inject_user_system_to_messages(messages, user_system)
+    messages = normalize_messages(messages)
     if not cache_cfg["respect_client_cache_control"]:
         messages = _strip_message_cache_control(messages)
     messages = add_cache_breakpoints(
