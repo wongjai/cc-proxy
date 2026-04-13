@@ -405,13 +405,20 @@ def _inject_cache_on_msg(msg, default_ttl=""):
     content = msg.get("content")
     if isinstance(content, list) and content:
         content = list(content)
-        if isinstance(content[-1], dict):
-            last_block = dict(content[-1])
-            last_block["cache_control"] = make_cache_control(default_ttl)
-            content[-1] = last_block
+        for i in range(len(content) - 1, -1, -1):
+            block = content[i]
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and not str(block.get("text", "")).strip():
+                continue
+            block = dict(block)
+            block["cache_control"] = make_cache_control(default_ttl)
+            content[i] = block
             msg["content"] = content
+            break
     elif isinstance(content, str):
-        msg["content"] = [{"type": "text", "text": content, "cache_control": make_cache_control(default_ttl)}]
+        if content.strip():
+            msg["content"] = [{"type": "text", "text": content, "cache_control": make_cache_control(default_ttl)}]
     return msg
 
 
