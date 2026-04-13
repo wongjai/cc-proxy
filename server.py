@@ -57,7 +57,7 @@ ANTHROPIC_API_BASE = "https://api.anthropic.com"
 OAUTH_FILE = os.path.join(BASE_DIR, CFG.get("oauth_file", "oauth.json"))
 DB_PATH = os.path.join(BASE_DIR, CFG.get("db_path", "cc-proxy.db"))
 
-CC_VERSION = "2.1.92"
+CC_VERSION = "2.1.104"
 FINGERPRINT_SALT = "59cf53e54c78"
 CC_ENTRYPOINT = "cli"
 USER_TYPE = "external"
@@ -65,12 +65,14 @@ USER_TYPE = "external"
 BASE_BETAS = [
     "claude-code-20250219",
     "oauth-2025-04-20",
-    "interleaved-thinking-2025-05-14",
-    "prompt-caching-scope-2026-01-05",
-    "effort-2025-11-24",
-    "redact-thinking-2026-02-12",
-    "context-management-2025-06-27",
 ]
+THINKING_BETAS = [
+    "interleaved-thinking-2025-05-14",
+    "redact-thinking-2026-02-12",
+]
+CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
+PROMPT_CACHING_SCOPE_BETA = "prompt-caching-scope-2026-01-05"
+EFFORT_BETA = "effort-2025-11-24"
 EXTENDED_CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11"
 
 UPSTREAM_TIMEOUT = httpx.Timeout(connect=15.0, read=330.0, write=30.0, pool=15.0)
@@ -579,6 +581,42 @@ def payload_uses_one_hour_ttl(payload):
     return False
 
 
+def _append_beta(betas, beta):
+    if beta and beta not in betas:
+        betas.append(beta)
+
+
+def payload_uses_thinking(payload):
+    thinking = payload.get("thinking")
+    return isinstance(thinking, dict) and thinking.get("type") in {"enabled", "adaptive"}
+
+
+def payload_uses_context_management(payload):
+    cm = payload.get("context_management")
+    edits = cm.get("edits") if isinstance(cm, dict) else None
+    return isinstance(edits, list) and bool(edits)
+
+
+def payload_uses_effort(payload):
+    output_config = payload.get("output_config")
+    return isinstance(output_config, dict) and bool(output_config.get("effort"))
+
+
+def build_anthropic_betas(payload):
+    betas = list(BASE_BETAS)
+    if payload_uses_thinking(payload):
+        for beta in THINKING_BETAS:
+            _append_beta(betas, beta)
+    if payload_uses_context_management(payload):
+        _append_beta(betas, CONTEXT_MANAGEMENT_BETA)
+    _append_beta(betas, PROMPT_CACHING_SCOPE_BETA)
+    if payload_uses_effort(payload):
+        _append_beta(betas, EFFORT_BETA)
+    if payload_uses_one_hour_ttl(payload):
+        _append_beta(betas, EXTENDED_CACHE_TTL_BETA)
+    return betas
+
+
 # ─── Metadata（使用緩存的 oauth）───
 
 def build_metadata():
@@ -687,9 +725,7 @@ def sign_body(payload_dict):
 
 
 def build_upstream_headers(access_token, payload):
-    betas = list(BASE_BETAS)
-    if payload_uses_one_hour_ttl(payload):
-        betas.append(EXTENDED_CACHE_TTL_BETA)
+    betas = build_anthropic_betas(payload)
     return {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {access_token}",
@@ -806,7 +842,7 @@ async def lifespan(app: FastAPI):
     cache_cfg = get_cache_control_config()
     print(f"CC Proxy v3.0 | claude-cli/{CC_VERSION}")
     print(f"  device_id: {DEVICE_ID[:16]}...")
-    print(f"  betas: {len(BASE_BETAS)} base")
+    print(f"  betas: {len(BASE_BETAS)} base + dynamic per payload")
     print(f"  cache ttl default: {cache_cfg['default_ttl'] or '5m'}")
     print(f"  respect client cache_control: {cache_cfg['respect_client_cache_control']}")
     print(f"  api_keys: {len(CFG.get('api_keys', {}))}")

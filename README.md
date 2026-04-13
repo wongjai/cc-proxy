@@ -267,7 +267,7 @@ cc-proxy/
 - `api_keys` 为空时所有请求都会被拒绝，至少需要添加一个
 - 数据库文件 `cc-proxy.db` 运行后自动创建，使用 WAL 模式
 - `telegram_admin_ids` 为空数组时任何人都可以使用 Bot，生产环境建议填写管理员 ID
-- 默认伪装版本为 Claude CLI v2.1.92，如需更新请修改 `server.py` 中的 `CC_VERSION` 和 `BASE_BETAS`
+- 默认伪装版本为 Claude CLI v2.1.104，如需更新请修改 `server.py` 中的 `CC_VERSION`，以及按需调整 `build_anthropic_betas()`
 
 ## License
 
