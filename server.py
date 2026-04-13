@@ -690,6 +690,9 @@ def _restore_tool_names_in_chunk(chunk_bytes):
 
 def transform_request(body):
     cache_cfg = get_cache_control_config()
+    effective_default_ttl = cache_cfg["default_ttl"]
+    if cache_cfg["respect_client_cache_control"] and payload_uses_one_hour_ttl(body):
+        effective_default_ttl = "1h"
     messages = body.get("messages", [])
     user_system = body.get("system")
     messages = inject_user_system_to_messages(messages, user_system)
@@ -698,10 +701,10 @@ def transform_request(body):
         messages = _strip_message_cache_control(messages)
     messages = add_cache_breakpoints(
         messages,
-        default_ttl=cache_cfg["default_ttl"],
+        default_ttl=effective_default_ttl,
         preserve_existing=cache_cfg["respect_client_cache_control"],
     )
-    system_blocks = build_system_blocks(messages, cache_cfg["default_ttl"])
+    system_blocks = build_system_blocks(messages, effective_default_ttl)
 
     model = body.get("model", "claude-sonnet-4-20250514")
     ml = model.lower()
@@ -734,7 +737,7 @@ def transform_request(body):
             tools = _strip_tool_cache_control(tools)
         if tools and not _tools_have_cache_control(tools):
             tools[-1] = dict(tools[-1])
-            tools[-1]["cache_control"] = make_cache_control(cache_cfg["default_ttl"])
+            tools[-1]["cache_control"] = make_cache_control(effective_default_ttl)
         payload["tools"] = tools
 
     if "tool_choice" in body:
