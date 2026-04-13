@@ -672,7 +672,7 @@ def transform_request(body):
         "messages": messages,
         "system": system_blocks,
         "max_tokens": body.get("max_tokens", 128000),
-        "stream": body.get("stream", True),
+        "stream": body.get("stream", False),
         "metadata": build_metadata(),
         "temperature": 1,
     }
@@ -921,7 +921,7 @@ async def proxy_messages(request: Request):
         return build_claude_error_response(400, "invalid_request_error", f"invalid json: {e}")
 
     model = body.get("model", "?")
-    is_stream = body.get("stream", True)
+    is_stream = body.get("stream", False)
     msg_count = len(body.get("messages", []))
     tool_count = len(body.get("tools", []))
 
