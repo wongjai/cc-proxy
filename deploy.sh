@@ -32,6 +32,10 @@ if [ ! -f "$INSTALL_DIR/config.json" ]; then
   "listen_port": 18081,
   "api_keys": {},
   "oauth_file": "oauth.json",
+  "cache_control": {
+    "default_ttl": "",
+    "respect_client_cache_control": false
+  },
   "telegram_bot_token": "",
   "telegram_admin_ids": [],
   "db_path": "cc-proxy.db",

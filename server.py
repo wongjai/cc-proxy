@@ -62,7 +62,7 @@ FINGERPRINT_SALT = "59cf53e54c78"
 CC_ENTRYPOINT = "cli"
 USER_TYPE = "external"
 
-BETAS = [
+BASE_BETAS = [
     "claude-code-20250219",
     "oauth-2025-04-20",
     "interleaved-thinking-2025-05-14",
@@ -71,6 +71,7 @@ BETAS = [
     "redact-thinking-2026-02-12",
     "context-management-2025-06-27",
 ]
+EXTENDED_CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11"
 
 UPSTREAM_TIMEOUT = httpx.Timeout(connect=15.0, read=330.0, write=30.0, pool=15.0)
 CLI_USER_AGENT = f"claude-cli/{CC_VERSION} ({USER_TYPE}, {CC_ENTRYPOINT})"
@@ -331,13 +332,41 @@ def compute_fingerprint(messages):
 
 # ─── System prompt ───
 
-def build_system_blocks(messages):
+def get_cache_control_config():
+    cfg = load_config()
+    raw = cfg.get("cache_control", {})
+    if not isinstance(raw, dict):
+        raw = {}
+
+    default_ttl = raw.get("default_ttl", "")
+    if default_ttl is None:
+        default_ttl = ""
+    default_ttl = str(default_ttl).strip().lower()
+    if default_ttl in ("", "default", "5m", "none", "off"):
+        default_ttl = ""
+    elif default_ttl != "1h":
+        default_ttl = ""
+
+    return {
+        "default_ttl": default_ttl,
+        "respect_client_cache_control": bool(raw.get("respect_client_cache_control", False)),
+    }
+
+
+def make_cache_control(default_ttl=""):
+    cache_control = {"type": "ephemeral"}
+    if default_ttl == "1h":
+        cache_control["ttl"] = "1h"
+    return cache_control
+
+
+def build_system_blocks(messages, default_ttl=""):
     fp = compute_fingerprint(messages)
     version = f"{CC_VERSION}.{fp}"
     attribution = f"x-anthropic-billing-header: cc_version={version}; cc_entrypoint={CC_ENTRYPOINT}; cch=00000;"
     return [
         {"type": "text", "text": attribution},
-        {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": make_cache_control(default_ttl)},
     ]
 
 
@@ -369,17 +398,18 @@ def inject_user_system_to_messages(messages, user_system):
 
 # ─── 緩存斷點 ───
 
-def _inject_cache_on_msg(msg):
+def _inject_cache_on_msg(msg, default_ttl=""):
     msg = dict(msg)
     content = msg.get("content")
     if isinstance(content, list) and content:
         content = list(content)
-        last_block = dict(content[-1])
-        last_block["cache_control"] = {"type": "ephemeral"}
-        content[-1] = last_block
-        msg["content"] = content
+        if isinstance(content[-1], dict):
+            last_block = dict(content[-1])
+            last_block["cache_control"] = make_cache_control(default_ttl)
+            content[-1] = last_block
+            msg["content"] = content
     elif isinstance(content, str):
-        msg["content"] = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
+        msg["content"] = [{"type": "text", "text": content, "cache_control": make_cache_control(default_ttl)}]
     return msg
 
 
@@ -421,16 +451,35 @@ def _strip_message_cache_control(messages):
     return result
 
 
-def add_cache_breakpoints(messages):
+def _tools_have_cache_control(tools):
+    for tool in tools:
+        if isinstance(tool, dict) and "cache_control" in tool:
+            return True
+    return False
+
+
+def _strip_tool_cache_control(tools):
+    result = []
+    for tool in tools:
+        if isinstance(tool, dict) and "cache_control" in tool:
+            tool = {k: v for k, v in tool.items() if k != "cache_control"}
+        result.append(tool)
+    return result
+
+
+def add_cache_breakpoints(messages, default_ttl="", preserve_existing=False):
     """注入緩存斷點。斷點位置：倒數第二個 user turn + 最後一條消息。
     加上 system + tools 共 4 個斷點（上限）。
-    注意：調用前應先 _strip_message_cache_control 清除客戶端標記。"""
+    preserve_existing=True 時，若客戶端已在 messages 中提供 cache_control，則完全保留。"""
     if not messages:
         return messages
     messages = [dict(m) for m in messages]
 
+    if preserve_existing and any(_msg_has_cache_control(msg) for msg in messages):
+        return messages
+
     # 1. 最後一條消息
-    messages[-1] = _inject_cache_on_msg(messages[-1])
+    messages[-1] = _inject_cache_on_msg(messages[-1], default_ttl)
 
     # 2. 倒數第二個 user turn：緩存多輪對話歷史
     #    確保會話前綴在連續請求間可被複用
@@ -440,10 +489,94 @@ def add_cache_breakpoints(messages):
             if messages[i].get("role") == "user":
                 user_count += 1
                 if user_count == 2:
-                    messages[i] = _inject_cache_on_msg(messages[i])
+                    messages[i] = _inject_cache_on_msg(messages[i], default_ttl)
                     break
 
     return messages
+
+
+def normalize_cache_control_ttl(payload):
+    """1h TTL 不能出現在任意更早的 5m/default breakpoint 之後；較晚出現的 1h 會降級為預設 5m。"""
+    seen_default_ttl = False
+
+    def normalize_cache_control(cache_control):
+        nonlocal seen_default_ttl
+        if not isinstance(cache_control, dict):
+            seen_default_ttl = True
+            return cache_control
+
+        ttl = cache_control.get("ttl")
+        if ttl == "1h":
+            if seen_default_ttl:
+                cache_control = dict(cache_control)
+                cache_control.pop("ttl", None)
+                seen_default_ttl = True
+                return cache_control
+            return cache_control
+
+        seen_default_ttl = True
+        if ttl == "5m":
+            cache_control = dict(cache_control)
+            cache_control.pop("ttl", None)
+        return cache_control
+
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        new_tools = []
+        for tool in tools:
+            if isinstance(tool, dict) and "cache_control" in tool:
+                tool = dict(tool)
+                tool["cache_control"] = normalize_cache_control(tool.get("cache_control"))
+            new_tools.append(tool)
+        payload["tools"] = new_tools
+
+    system = payload.get("system")
+    if isinstance(system, list):
+        new_system = []
+        for block in system:
+            if isinstance(block, dict) and "cache_control" in block:
+                block = dict(block)
+                block["cache_control"] = normalize_cache_control(block.get("cache_control"))
+            new_system.append(block)
+        payload["system"] = new_system
+
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        new_messages = []
+        for msg in messages:
+            if isinstance(msg, dict) and isinstance(msg.get("content"), list):
+                msg = dict(msg)
+                new_content = []
+                for block in msg["content"]:
+                    if isinstance(block, dict) and "cache_control" in block:
+                        block = dict(block)
+                        block["cache_control"] = normalize_cache_control(block.get("cache_control"))
+                    new_content.append(block)
+                msg["content"] = new_content
+            new_messages.append(msg)
+        payload["messages"] = new_messages
+
+    return payload
+
+
+def payload_uses_one_hour_ttl(payload):
+    def has_one_hour(items):
+        if not isinstance(items, list):
+            return False
+        for item in items:
+            if isinstance(item, dict):
+                cache_control = item.get("cache_control")
+                if isinstance(cache_control, dict) and cache_control.get("ttl") == "1h":
+                    return True
+        return False
+
+    if has_one_hour(payload.get("tools")) or has_one_hour(payload.get("system")):
+        return True
+
+    for msg in payload.get("messages", []):
+        if isinstance(msg, dict) and has_one_hour(msg.get("content")):
+            return True
+    return False
 
 
 # ─── Metadata（使用緩存的 oauth）───
@@ -478,12 +611,18 @@ def _restore_tool_names_in_chunk(chunk_bytes):
 # ─── 請求轉換 ───
 
 def transform_request(body):
+    cache_cfg = get_cache_control_config()
     messages = body.get("messages", [])
     user_system = body.get("system")
     messages = inject_user_system_to_messages(messages, user_system)
-    messages = _strip_message_cache_control(messages)
-    messages = add_cache_breakpoints(messages)
-    system_blocks = build_system_blocks(messages)
+    if not cache_cfg["respect_client_cache_control"]:
+        messages = _strip_message_cache_control(messages)
+    messages = add_cache_breakpoints(
+        messages,
+        default_ttl=cache_cfg["default_ttl"],
+        preserve_existing=cache_cfg["respect_client_cache_control"],
+    )
+    system_blocks = build_system_blocks(messages, cache_cfg["default_ttl"])
 
     model = body.get("model", "claude-sonnet-4-20250514")
     ml = model.lower()
@@ -512,8 +651,11 @@ def transform_request(body):
         tools = [dict(t) for t in body["tools"]]
         for t in tools:
             t["name"] = _sanitize_tool_name(t["name"])
-        tools[-1] = dict(tools[-1])
-        tools[-1]["cache_control"] = {"type": "ephemeral"}
+        if not cache_cfg["respect_client_cache_control"]:
+            tools = _strip_tool_cache_control(tools)
+        if tools and not _tools_have_cache_control(tools):
+            tools[-1] = dict(tools[-1])
+            tools[-1]["cache_control"] = make_cache_control(cache_cfg["default_ttl"])
         payload["tools"] = tools
 
     if "tool_choice" in body:
@@ -528,7 +670,7 @@ def transform_request(body):
     if supports_adaptive:
         payload["output_config"] = {"effort": "high"}
 
-    return payload
+    return normalize_cache_control_ttl(payload)
 
 
 # ─── CCH 簽名 ───
@@ -544,12 +686,15 @@ def sign_body(payload_dict):
     return body_bytes.replace(CCH_PLACEHOLDER, f"cch={cch}".encode("ascii"), 1)
 
 
-def build_upstream_headers(access_token):
+def build_upstream_headers(access_token, payload):
+    betas = list(BASE_BETAS)
+    if payload_uses_one_hour_ttl(payload):
+        betas.append(EXTENDED_CACHE_TTL_BETA)
     return {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {access_token}",
         "anthropic-version": "2023-06-01",
-        "anthropic-beta": ",".join(BETAS),
+        "anthropic-beta": ",".join(betas),
         "x-app": "cli",
         "User-Agent": CLI_USER_AGENT,
         "x-client-request-id": str(uuid.uuid4()),
@@ -658,9 +803,12 @@ async def lifespan(app: FastAPI):
                     get_access_token_sync, _refresh_token, _load_oauth, _save_oauth)
         tgbot.start()
 
+    cache_cfg = get_cache_control_config()
     print(f"CC Proxy v3.0 | claude-cli/{CC_VERSION}")
     print(f"  device_id: {DEVICE_ID[:16]}...")
-    print(f"  betas: {len(BETAS)}")
+    print(f"  betas: {len(BASE_BETAS)} base")
+    print(f"  cache ttl default: {cache_cfg['default_ttl'] or '5m'}")
+    print(f"  respect client cache_control: {cache_cfg['respect_client_cache_control']}")
     print(f"  api_keys: {len(CFG.get('api_keys', {}))}")
     print(f"  oauth: {OAUTH_FILE}")
     print(f"  db: {DB_PATH}")
@@ -784,7 +932,7 @@ async def proxy_messages(request: Request):
         )
         return build_claude_error_response(502, "api_error", f"oauth error: {e}")
 
-    headers = build_upstream_headers(access_token)
+    headers = build_upstream_headers(access_token, payload)
     signed_body = sign_body(payload)
     max_attempts = 2
     retry_count = 0
@@ -798,7 +946,7 @@ async def proxy_messages(request: Request):
             upstream_resp = None
             connect_ms = None
             try:
-                headers = build_upstream_headers(access_token)
+                headers = build_upstream_headers(access_token, payload)
                 upstream_req = _http_client.build_request(
                     "POST",
                     f"{ANTHROPIC_API_BASE}/v1/messages?beta=true",

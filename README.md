@@ -9,7 +9,7 @@ Claude Code 伪装反向代理。接收标准 Anthropic `/v1/messages` 请求，
 - **OAuth Token 管理** — Token 过期前自动刷新，也可通过 Bot 手动刷新或重新登录
 - **多 API Key** — 支持多个自定义 API Key，通过 `Authorization: Bearer <key>` 或 `x-api-key` 鉴权
 - **智能 Thinking** — 根据模型自动选择 thinking 模式：Opus 用 adaptive，Sonnet 用 enabled（budget 10K），Haiku 不启用
-- **缓存断点** — 自动在最后两条用户消息上注入 `cache_control`，最大化 Prompt Caching 命中率
+- **弹性 TTL 缓存断点** — 默认继续按 Claude Code 方式注入缓存断点，可切换 5 分钟 / 1 小时 TTL，并可选择是否保留客户端自带 `cache_control`
 - **SSE 流式透传** — 完整转发上游 SSE 流，实时记录 Token 用量和耗时
 - **SQLite 日志** — 每条请求记录状态、耗时、Token 用量、完整请求/响应体
 - **Telegram Bot** — 可选的管理面板：API Key 管理、OAuth 管理、统计汇总、调用日志
@@ -32,7 +32,7 @@ cp server.py tgbot.py db.py config.json /opt/cc-proxy/
 cd /opt/cc-proxy
 python3 -m venv venv
 source venv/bin/activate
-pip install requests xxhash
+pip install fastapi uvicorn httpx xxhash
 ```
 
 ### 配置
@@ -47,6 +47,10 @@ pip install requests xxhash
     "my-app": "ccp-your-api-key-here"
   },
   "oauth_file": "oauth.json",
+  "cache_control": {
+    "default_ttl": "",
+    "respect_client_cache_control": false
+  },
   "telegram_bot_token": "",
   "telegram_admin_ids": [],
   "db_path": "cc-proxy.db",
@@ -60,10 +64,41 @@ pip install requests xxhash
 | `listen_port` | 监听端口 |
 | `api_keys` | API Key 映射，`名称: Key`，可通过 TG Bot 管理 |
 | `oauth_file` | OAuth Token 文件路径（相对于项目目录） |
+| `cache_control.default_ttl` | 代理自动注入断点时使用的 TTL，留空表示 Anthropic 默认 5 分钟；设为 `1h` 会自动附加 `extended-cache-ttl-2025-04-11` beta |
+| `cache_control.respect_client_cache_control` | `false`（默认）时由代理统一管理 messages/tools 的缓存断点；`true` 时保留客户端自带 `cache_control`，仅在缺失时补充代理断点 |
 | `telegram_bot_token` | Telegram Bot Token，留空则不启用 Bot |
 | `telegram_admin_ids` | 允许使用 Bot 的 Telegram 用户 ID 列表，空数组表示不限制 |
 | `db_path` | SQLite 数据库路径 |
 | `log_dir` | 日志目录（预留字段） |
+
+#### TTL 配置示例
+
+默认 5 分钟（与当前 Anthropic 默认行为一致）：
+
+```json
+"cache_control": {
+  "default_ttl": "",
+  "respect_client_cache_control": false
+}
+```
+
+统一使用 1 小时 TTL，由代理继续按 Claude Code 风格自动注入：
+
+```json
+"cache_control": {
+  "default_ttl": "1h",
+  "respect_client_cache_control": false
+}
+```
+
+保留客户端自带 `cache_control/ttl`，仅在客户端没带时才补代理断点：
+
+```json
+"cache_control": {
+  "default_ttl": "1h",
+  "respect_client_cache_control": true
+}
+```
 
 #### oauth.json
 
@@ -171,13 +206,13 @@ CC Proxy 模拟 Claude Code CLI 客户端的完整特征：
 | 特征 | 实现 |
 |------|------|
 | **User-Agent** | `claude-cli/{version} (external, cli)` |
-| **Beta Features** | 7 个 Claude Code 专属 beta flag |
+| **Beta Features** | 7 个 Claude Code 专属 beta flag；使用 1h TTL 时自动追加 extended-cache beta |
 | **Fingerprint** | 基于首条用户消息 + 盐值 + 版本号的 SHA256 前 3 位 |
 | **CCH 签名** | xxHash64 全 body 签名，嵌入 billing header |
 | **System Prompt** | 注入 billing attribution + Claude Code 身份声明 |
 | **Metadata** | 包含 device_id 和 account_uuid |
 | **Thinking** | Opus: adaptive / Sonnet: enabled (10K budget) / Haiku: 关闭 |
-| **缓存断点** | 最后两条 user 消息 + tools 末尾 + system 末尾 |
+| **缓存断点** | 默认仍由代理按 Claude Code 风格注入（最后两条 user 消息 + tools 末尾 + system 末尾），并支持配置 TTL / 保留客户端 cache_control |
 | **Context Management** | `clear_thinking_20251015` + `keep: all` |
 
 ### 请求转换流程
@@ -191,7 +226,7 @@ API Key 验证
   ↓
 注入 Claude Code system blocks (billing header + identity)
   ↓
-添加缓存断点 (最后两条 user message + tools 末尾)
+按配置注入或保留缓存断点 (Claude Code 风格；支持 5m/1h TTL)
   ↓
 设置 thinking 模式 (根据模型)
   ↓
@@ -232,7 +267,7 @@ cc-proxy/
 - `api_keys` 为空时所有请求都会被拒绝，至少需要添加一个
 - 数据库文件 `cc-proxy.db` 运行后自动创建，使用 WAL 模式
 - `telegram_admin_ids` 为空数组时任何人都可以使用 Bot，生产环境建议填写管理员 ID
-- 默认伪装版本为 Claude CLI v2.1.92，如需更新请修改 `server.py` 中的 `CC_VERSION` 和 `BETAS`
+- 默认伪装版本为 Claude CLI v2.1.92，如需更新请修改 `server.py` 中的 `CC_VERSION` 和 `BASE_BETAS`
 
 ## License
 
